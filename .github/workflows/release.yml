@@ -14,13 +14,6 @@ jobs:
       actions: read   # required to download artifacts from other workflows
 
     steps:
-      - name: Find build artifacts
-        uses: mr-smithers-excellent/find-build-artifacts-action@v1
-        id: find_artifacts
-        with:
-          workflow: 'wheels.yml'
-          commit: ${{ github.sha }}
-
       - name: Download artifacts from build workflow
         uses: actions/download-artifact@v5
         with:
