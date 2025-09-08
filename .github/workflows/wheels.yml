@@ -1,6 +1,10 @@
 name: Build
 
-on: [release, push, pull_request]
+on:
+  push:
+    branches:
+      - main
+  pull_request:
 
 jobs:
   build_wheels:
@@ -47,19 +51,3 @@ jobs:
       with:
         name: cibw-sdist
         path: dist/*.tar.gz
-
-  upload_all:
-    needs: [build_wheels, make_sdist]
-    environment: pypi
-    permissions:
-      id-token: write
-    runs-on: ubuntu-latest
-    if: github.event_name == 'release' && github.event.action == 'published'
-    steps:
-    - uses: actions/download-artifact@v5
-      with:
-        pattern: cibw-*
-        path: dist
-        merge-multiple: true
-
-    - uses: pypa/gh-action-pypi-publish@release/v1
