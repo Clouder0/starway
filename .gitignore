@@ -1,0 +1,9 @@
+build
+.xmake
+.vscode
+__pycache__
+dist
+.venv
+.ruff_cache
+.pytest_cache
+wheelhouse

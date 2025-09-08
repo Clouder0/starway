@@ -1,0 +1,36 @@
+from typing import Annotated
+
+import numpy
+from numpy.typing import NDArray
+
+class ClientSendFuture:
+    def done(self) -> bool: ...
+    def wait(self) -> None: ...
+    def exception(self) -> str: ...
+
+class Client:
+    def __init__(self, addr: str, port: int) -> None: ...
+    def send(
+        self,
+        buffer: Annotated[NDArray[numpy.uint8], dict(shape=(None,), device="cpu")],
+        tag: int,
+        done_callback: object,
+        fail_callback: object,
+    ) -> ClientSendFuture: ...
+
+class ServerRecvFuture:
+    def done(self) -> bool: ...
+    def exception(self) -> str: ...
+    def info(self) -> tuple[int, int]: ...
+    def wait(self) -> None: ...
+
+class Server:
+    def __init__(self, addr: str, port: int) -> None: ...
+    def recv(
+        self,
+        buffer: Annotated[NDArray[numpy.uint8], dict(shape=(None,), device="cpu")],
+        tag: int,
+        tag_mask: int,
+        done_callback: object,
+        fail_callback: object,
+    ) -> ServerRecvFuture: ...
