@@ -6,30 +6,50 @@ import ctypes.util
 import os
 import warnings
 from collections.abc import Callable
-from typing import Annotated, Any, overload
+from typing import Annotated, Any, Literal, overload
 
 import numpy as np
 from numpy.typing import NDArray
 
 use_system_lib = os.environ.get("STARWAY_USE_SYSTEM_UCX", "true") == "true"
-_loaded_system_libs = None
+_system_ucx_available = False
+if ctypes.util.find_library("ucp") is not None:
+    _system_ucx_available = True
 
-if use_system_lib:
-    print("Try to use system lib")
-    lib_ucs = ctypes.util.find_library("ucs")
-    lib_uct = ctypes.util.find_library("uct")
-    lib_ucm = ctypes.util.find_library("ucm")
-    lib_ucp = ctypes.util.find_library("ucp")
-    if lib_ucs and lib_uct and lib_ucm and lib_ucp:
-        ctypes.CDLL(lib_ucs, mode=os.RTLD_GLOBAL)
-        ctypes.CDLL(lib_uct, mode=os.RTLD_GLOBAL)
-        ctypes.CDLL(lib_ucm, mode=os.RTLD_GLOBAL)
-        ctypes.CDLL(lib_ucp, mode=os.RTLD_GLOBAL)
-        _loaded_system_libs = [lib_ucs, lib_uct, lib_ucm, lib_ucp]
-    else:
+_used_ucx = "system"
+
+if not use_system_lib:
+    print("Try to load libucx from wheel package.")
+    try:
+        import libucx  # type: ignore
+
+        libucx.load_library()
+        _used_ucx = "wheel"
+    except ImportError:
+        if _system_ucx_available:
+            warnings.warn(
+                "STARWAY_USE_SYSTEM_UCX set to false, but libucx not found in wheel package. Try to load libucx from system."
+            )
+            _used_ucx = "system"
+        else:
+            raise ImportError(
+                "STARWAY_USE_SYSTEM_UCX is set to false, but cannot find python package libucx, and no fallback system-level libucx installed either! Please install it by: pip install libucx-cu12"
+            )
+else:
+    if not _system_ucx_available:
         warnings.warn(
-            "STARWAY_USE_SYSTEM_UCX is set to true, but cannot find system OpenUCX libs! \nFalling back to bundled ones."
+            "STARWAY_USE_SYSTEM_UCX set to true, but libucx not found in system. Try to load libucx from wheel package."
         )
+        try:
+            import libucx  # type: ignore
+
+            libucx.load_library()
+            _used_ucx = "wheel"
+        except ImportError:
+            raise ImportError(
+                "libucx wheel not installed either. No libucx availalbe. Fatal Error."
+            )
+
 
 from ._bindings import Client as _Client  # type: ignore # noqa: E402
 from ._bindings import (  # type: ignore # noqa: E402
@@ -47,8 +67,9 @@ from ._bindings import (  # type: ignore # noqa: E402
 )
 
 
-def check_sys_libs():
-    return _loaded_system_libs
+def check_sys_libs() -> Literal["system"] | Literal["wheel"]:
+    assert _used_ucx == "system" or _used_ucx == "wheel"
+    return _used_ucx
 
 
 @overload

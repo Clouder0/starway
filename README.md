@@ -12,6 +12,23 @@ Current Python alternatives are lacking core features:
 1. ZeroMQ, no support for RDMA.
 2. MPI, hard to use, hard to setup environment properly.
 
+## Installation
+
+Starway depends on OpenUCX, which must be linked dynamically. There are two options:
+
+1. Install OpenUCX system-wide, or whatever method you like as long as it can be found dynamically.
+2. Install `libucx-cu12` wheel package, which contains `libucx.so` files that can be loaded by Starway during initialization.
+
+We don't add `libucx-cu12`  as Starway Python dependency by default, but generally you can install it on your cluster machines as a fallback option: when libucx cannot be found in system, it would look for wheel installation.
+
+You can use environment variable to control System/Wheel preference:
+
+```py
+import os
+os.environ["STARWAY_USE_SYSTEM_UCX"] = "false" # defaults to true
+import starway  # now we will use libucx-cu12 pypi wheel package, while falling back to system if not found
+```
+
 ## Full-Duplex Communication
 
 Starway now supports full-duplex communication, allowing for simultaneous, two-way data exchange between the client and server. This feature significantly improves the library's responsiveness and efficiency in handling real-time data streams.
