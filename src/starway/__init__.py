@@ -1,18 +1,54 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import ctypes.util
+import os
+import warnings
 from collections.abc import Callable
 from typing import Annotated, Any, overload
 
 import numpy as np
 from numpy.typing import NDArray
 
-from ._bindings import Client as _Client
-from ._bindings import ClientRecvFuture as _ClientRecvFuture
-from ._bindings import ClientSendFuture as _ClientSendFuture
-from ._bindings import Server as _Server
-from ._bindings import ServerRecvFuture as _ServerRecvFuture
-from ._bindings import ServerSendFuture as _ServerSendFuture
+use_system_lib = os.environ.get("STARWAY_USE_SYSTEM_UCX", "true") == "true"
+_loaded_system_libs = None
+
+if use_system_lib:
+    print("Try to use system lib")
+    lib_ucs = ctypes.util.find_library("ucs")
+    lib_uct = ctypes.util.find_library("uct")
+    lib_ucm = ctypes.util.find_library("ucm")
+    lib_ucp = ctypes.util.find_library("ucp")
+    if lib_ucs and lib_uct and lib_ucm and lib_ucp:
+        ctypes.CDLL(lib_ucs, mode=os.RTLD_GLOBAL)
+        ctypes.CDLL(lib_uct, mode=os.RTLD_GLOBAL)
+        ctypes.CDLL(lib_ucm, mode=os.RTLD_GLOBAL)
+        ctypes.CDLL(lib_ucp, mode=os.RTLD_GLOBAL)
+        _loaded_system_libs = [lib_ucs, lib_uct, lib_ucm, lib_ucp]
+    else:
+        warnings.warn(
+            "STARWAY_USE_SYSTEM_UCX is set to true, but cannot find system OpenUCX libs! \nFalling back to bundled ones."
+        )
+
+from ._bindings import Client as _Client  # type: ignore # noqa: E402
+from ._bindings import (  # type: ignore # noqa: E402
+    ClientRecvFuture as _ClientRecvFuture,
+)
+from ._bindings import (  # noqa: E402 # type: ignore
+    ClientSendFuture as _ClientSendFuture,
+)
+from ._bindings import Server as _Server  # type: ignore # noqa: E402
+from ._bindings import (  # type: ignore # noqa: E402
+    ServerRecvFuture as _ServerRecvFuture,
+)
+from ._bindings import (  # type: ignore # noqa: E402
+    ServerSendFuture as _ServerSendFuture,
+)
+
+
+def check_sys_libs():
+    return _loaded_system_libs
 
 
 @overload
@@ -319,4 +355,11 @@ class Client:
         return ret
 
 
-__all__ = ["Server", "Client", "SendFuture", "RecvFuture", "wrap_to_asyncio"]
+__all__ = [
+    "Server",
+    "Client",
+    "SendFuture",
+    "RecvFuture",
+    "wrap_to_asyncio",
+    "check_sys_libs",
+]

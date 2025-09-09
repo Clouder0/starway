@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import Annotated
 
 import numpy
@@ -20,28 +21,28 @@ class Client:
         self,
         buffer: Annotated[NDArray[numpy.uint8], dict(shape=(None,), device="cpu")],
         tag: int,
-        done_callback: object,
-        fail_callback: object,
+        done_callback: Callable[[ClientSendFuture], None],
+        fail_callback: Callable[[ClientSendFuture], None],
     ) -> ClientSendFuture: ...
     def recv(
         self,
         buffer: Annotated[NDArray[numpy.uint8], dict(shape=(None,), device="cpu")],
         tag: int,
         tag_mask: int,
-        done_callback: object,
-        fail_callback: object,
+        done_callback: Callable[[ClientRecvFuture], None],
+        fail_callback: Callable[[ClientRecvFuture], None],
     ) -> ClientRecvFuture: ...
+
+class ServerSendFuture:
+    def done(self) -> bool: ...
+    def wait(self) -> None: ...
+    def exception(self) -> str: ...
 
 class ServerRecvFuture:
     def done(self) -> bool: ...
     def exception(self) -> str: ...
     def info(self) -> tuple[int, int]: ...
     def wait(self) -> None: ...
-
-class ServerSendFuture:
-    def done(self) -> bool: ...
-    def wait(self) -> None: ...
-    def exception(self) -> str: ...
 
 class Server:
     def __init__(self, addr: str, port: int) -> None: ...
@@ -50,8 +51,8 @@ class Server:
         buffer: Annotated[NDArray[numpy.uint8], dict(shape=(None,), device="cpu")],
         tag: int,
         tag_mask: int,
-        done_callback: object,
-        fail_callback: object,
+        done_callback: Callable[[ServerRecvFuture], None],
+        fail_callback: Callable[[ServerRecvFuture], None],
     ) -> ServerRecvFuture: ...
     def list_clients(self) -> list[int]: ...
     def send(
@@ -59,6 +60,6 @@ class Server:
         client_ep: int,
         buffer: Annotated[NDArray[numpy.uint8], dict(shape=(None,), device="cpu")],
         tag: int,
-        done_callback: object,
-        fail_callback: object,
+        done_callback: Callable[[ServerSendFuture], None],
+        fail_callback: Callable[[ServerSendFuture], None],
     ) -> ServerSendFuture: ...

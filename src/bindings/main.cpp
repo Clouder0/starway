@@ -251,6 +251,7 @@ struct Client {
         nb::gil_scoped_acquire acquire;
         dst.emplace(send_future_obj, tag, buf_size, buf_ptr);
       });
+      return send_future_obj;
     }
   }
   auto recv(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> &buffer,
@@ -265,6 +266,7 @@ struct Client {
       recv_q_.wait_emplace([&](auto &dst) {
         dst.emplace(recv_future_obj, tag, tag_mask, buf_size, buf_ptr);
       });
+      return recv_future_obj;
     }
   }
   void init_context() {
@@ -623,7 +625,7 @@ struct Server {
         nb::gil_scoped_acquire acquire;
         dst.emplace(recv_future_obj, tag, tag_mask, buf_size, buf_ptr);
       });
-      return;
+      return recv_future_obj;
     }
   }
   auto list_clients() -> std::vector<uintptr_t> {
@@ -646,7 +648,7 @@ struct Server {
         dst.emplace(send_future_obj, reinterpret_cast<uintptr_t>(client_ep),
                     tag, buf_size, buf_ptr);
       });
-      return;
+      return send_future_obj;
     }
   }
   Server(std::string_view addr, uint64_t port)
@@ -1058,9 +1060,19 @@ NB_MODULE(_bindings, m) {
   nb::class_<Client>(m, "Client", nb::type_slots(client_wrapper_slots))
       .def(nb::init<std::string_view, uint64_t>(), "addr"_a, "port"_a)
       .def("send", &Client::send, "buffer"_a, "tag"_a, "done_callback"_a,
-           "fail_callback"_a)
+           "fail_callback"_a,
+           nb::sig(
+               "def send(self, buffer: Annotated[NDArray[numpy.uint8], "
+               "dict(shape=(None,), device='cpu')], tag: int, done_callback: "
+               "Callable[[ClientSendFuture], None], fail_callback: "
+               "Callable[[ClientSendFuture], None]) -> ClientSendFuture"))
       .def("recv", &Client::recv, "buffer"_a, "tag"_a, "tag_mask"_a,
-           "done_callback"_a, "fail_callback"_a);
+           "done_callback"_a, "fail_callback"_a,
+           nb::sig("def recv(self, buffer: Annotated[NDArray[numpy.uint8], "
+                   "dict(shape=(None,), device='cpu')], tag: int, tag_mask: "
+                   "int, done_callback: Callable[[ClientRecvFuture], None], "
+                   "fail_callback: Callable[[ClientRecvFuture], None]) -> "
+                   "ClientRecvFuture"));
 
   nb::class_<ServerSendFuture>(m, "ServerSendFuture",
                                nb::type_slots(server_send_future_wrapper_slots))
@@ -1080,8 +1092,18 @@ NB_MODULE(_bindings, m) {
   nb::class_<Server>(m, "Server", nb::type_slots(server_wrapper_slots))
       .def(nb::init<std::string_view, uint64_t>(), "addr"_a, "port"_a)
       .def("recv", &Server::recv, "buffer"_a, "tag"_a, "tag_mask"_a,
-           "done_callback"_a, "fail_callback"_a)
+           "done_callback"_a, "fail_callback"_a,
+           nb::sig("def recv(self, buffer: Annotated[NDArray[numpy.uint8], "
+                   "dict(shape=(None,), device='cpu')], tag: int, tag_mask: "
+                   "int, done_callback: Callable[[ServerRecvFuture], None], "
+                   "fail_callback: Callable[[ServerRecvFuture], None]) -> "
+                   "ServerRecvFuture"))
       .def("list_clients", &Server::list_clients)
       .def("send", &Server::send, "client_ep"_a, "buffer"_a, "tag"_a,
-           "done_callback"_a, "fail_callback"_a);
+           "done_callback"_a, "fail_callback"_a,
+           nb::sig("def send(self, client_ep: int, buffer:  "
+                   "Annotated[NDArray[numpy.uint8], dict(shape=(None,), "
+                   "device='cpu')], tag: int, done_callback: "
+                   "Callable[[ServerSendFuture], None], fail_callback: "
+                   "Callable[[ServerSendFuture], None]) -> ServerSendFuture"));
 }
