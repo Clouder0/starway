@@ -12,7 +12,6 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 #include <optional>
-#include <print>
 #include <set>
 #include <thread>
 #include <ucp/api/ucp.h>
@@ -24,14 +23,28 @@
 namespace nb = nanobind;
 using namespace nb::literals;
 
-template <typename... _Args>
-inline void constexpr debug_print(std::format_string<_Args...> __fmt,
-                                  _Args &&...__args) {
-#ifdef DEBUG
-  std::println(stdout, __fmt, std::forward<_Args>(__args)...);
+#ifdef NDEBUG
+// --- RELEASE MODE ---
+// In release mode (when NDEBUG is defined), this macro expands to nothing.
+// The compiler will see an empty statement, and importantly, the arguments
+// passed to the macro will NEVER be evaluated.
+#define debug_print(...)                                                       \
+  do {                                                                         \
+  } while (0)
+
 #else
-#endif
-}
+// --- DEBUG MODE ---
+// In debug mode, the macro expands to a std::println call to stderr.
+// We use stderr for debug messages to separate them from normal program output
+// (stdout). The __VA_ARGS__ preprocessor token forwards all arguments to
+// std::println.
+#include <format>
+#include <iostream>
+#define debug_print(...)                                                       \
+  do {                                                                         \
+    std::cout << std::format(__VA_ARGS__) << "\n";                             \
+  } while (0)
+#endif // NDEBUG
 
 inline void ucp_check_status(ucs_status_t status, std::string_view msg) {
   if (status != UCS_OK) {
@@ -386,7 +399,7 @@ struct Client {
         ucp_worker_progress(worker_);
         flush_req_status = ucp_request_check_status(flush_status);
         debug_print("Flush req status {}",
-                    std::to_underlying(flush_req_status));
+                    static_cast<int64_t>(flush_req_status));
       } while (flush_req_status == UCS_INPROGRESS);
       debug_print("Flush request done.");
       ucp_request_free(flush_status);
@@ -967,10 +980,10 @@ int server_wrapper_tp_traverse(PyObject *self, visitproc visit, void *arg) {
   for (auto req : w->send_reqs_) {
     Py_VISIT(req.ptr());
   }
-  if(w->recv_q_.data.has_value()) {
+  if (w->recv_q_.data.has_value()) {
     Py_VISIT(w->recv_q_.data->recv_future.ptr());
   }
-  if(w->send_q_.data.has_value()) {
+  if (w->send_q_.data.has_value()) {
     Py_VISIT(w->send_q_.data->send_future.ptr());
   }
   return 0;

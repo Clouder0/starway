@@ -1,6 +1,6 @@
 [project]
 name = "starway"
-version = "0.2.1"
+version = "0.2.2"
 description = "Starway UCX P2P communication lib."
 readme = "README.md"
 authors = [
@@ -60,5 +60,5 @@ manylinux-x86_64-image = "manylinux_2_34"
 before-all = [
   "curl -L https://github.com/openucx/ucx/releases/download/v1.19.0/ucx-1.19.0.tar.gz -o ucx.tar.gz && tar xf ucx.tar.gz",
   "yum install -y rdma-core",
-  "cd ucx-1.19.0 && ./contrib/configure-release --with-ib --with-mlx5 && make -j && make install"
+  "cd ucx-1.19.0 && ./contrib/configure-release --disable-doxygen-doc --disable-doxygen-man --disable-doxygen-html --enable-optimizations --enable-tuning  --enable-devel-headers  --with-avx --with-mlx5 --with-rc --with-ud --with-dc --with-ib-hw-tm --with-dm && make -j && make install"
 ]
