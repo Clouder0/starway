@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <memory>
@@ -10,6 +11,7 @@
 #include <nanobind/stl/string_view.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
+#include <optional>
 #include <print>
 #include <set>
 #include <thread>
@@ -38,6 +40,80 @@ inline void ucp_check_status(ucs_status_t status, std::string_view msg) {
         std::string(msg));
   }
 }
+
+template <class T> struct Channel {
+  Channel() = default;
+  bool full() const { return status.load(std::memory_order_acquire) == 2; }
+  bool try_consume(auto &&reader)
+    requires requires(decltype(reader) r, std::optional<T> &&d) { r(d); }
+  {
+    if (status.load(std::memory_order_acquire) != 2) {
+      return false;
+    }
+    reader(data);
+    status.store(0, std::memory_order_release);
+    return true;
+  }
+  void wait_emplace(auto &&writer)
+    requires requires(decltype(writer) w, std::optional<T> &d) { w(d); }
+  {
+    // optimistic
+    uint8_t expected{0};
+    for (;;) {
+      if (status.compare_exchange_weak(expected, 1,
+                                       std::memory_order_acq_rel)) {
+        writer(data);
+        status.store(2, std::memory_order_release);
+        return;
+      }
+      while (status.load(std::memory_order_acquire) != 0) {
+        std::this_thread::yield();
+      }
+    }
+  }
+  std::atomic<uint8_t> status{0}; // 0 : spare, 1 : loading, 2 : load done
+  std::optional<T> data{};
+};
+
+template <typename T, size_t Capacity = 512> struct SPSCQueue {
+  SPSCQueue() = default;
+
+  bool full() const {
+    size_t tail = tail_.load(std::memory_order_relaxed);
+    size_t next_tail = (tail + 1) % (Capacity + 1);
+    return next_tail == head_.load(std::memory_order_acquire);
+  }
+
+  bool try_emplace(auto &&writer)
+    requires requires(decltype(writer) w, T &ref) { w(ref); }
+  {
+    size_t tail = tail_.load(std::memory_order_relaxed);
+    size_t next_tail = (tail + 1) % (Capacity + 1);
+    if (next_tail == head_.load(std::memory_order_acquire)) {
+      return false; // Full
+    }
+    writer(storage_[tail]);
+    tail_.store(next_tail, std::memory_order_release);
+    return true;
+  }
+
+  bool try_pop(auto &&reader)
+    requires requires(decltype(reader) r, T &&ref) { r(ref); }
+  {
+    size_t head = head_.load(std::memory_order_relaxed);
+    if (head == tail_.load(std::memory_order_acquire)) {
+      return false; // Empty
+    }
+    reader(storage_[head]);
+    head_.store((head + 1) % (Capacity + 1), std::memory_order_release);
+    return true;
+  }
+
+private:
+  std::array<T, Capacity + 1> storage_{};
+  alignas(64) std::atomic<size_t> head_{0};
+  alignas(64) std::atomic<size_t> tail_{0};
+};
 
 struct Client;
 struct ClientSendFuture : std::enable_shared_from_this<ClientSendFuture> {
@@ -83,6 +159,57 @@ struct ClientSendFuture : std::enable_shared_from_this<ClientSendFuture> {
 };
 
 struct ClientFrame {};
+
+struct ClientRecvFuture {
+  ClientRecvFuture(Client *client, nb::object done_callback,
+                   nb::object fail_callback)
+      : done_callback_(done_callback), fail_callback_(fail_callback),
+        client_(client) {}
+  auto done() const { return done_.load(std::memory_order_acquire); }
+  auto exception() const { return ucs_status_string(done_status_); }
+  auto set_result(ucs_status_t status) {
+    done_status_ = status;
+    done_.store(true, std::memory_order_release);
+    auto self = nb::find(this);
+    assert(self.is_valid());
+    if (status == UCS_OK) {
+      done_callback_(self);
+    } else {
+      fail_callback_(self);
+    }
+  }
+  auto info() const { return std::make_tuple(sender_tag_, length_); }
+  void wait() {
+    while (!done_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  }
+
+  friend struct Client;
+  std::atomic<bool> done_{false};
+  ucs_status_t done_status_{UCS_OK};
+  nb::object done_callback_;
+  nb::object fail_callback_;
+  void *req_;
+  Client *client_;
+  uint64_t sender_tag_{};
+  size_t length_{};
+};
+
+struct ClientSendPack {
+  nb::object send_future;
+  uint64_t tag;
+  size_t buf_size;
+  uint8_t *buf_ptr;
+};
+struct ClientRecvPack {
+  nb::object recv_future;
+  uint64_t tag;
+  uint64_t tag_mask;
+  size_t buf_size;
+  uint8_t *buf_ptr;
+};
+
 struct Client {
   Client(std::string_view addr, uint64_t port)
       : worker_thread_([this, addr, port]() { working_thread(addr, port); }) {
@@ -101,34 +228,31 @@ struct Client {
   }
   auto send(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> &buffer,
             uint64_t tag, nb::object done_callback, nb::object fail_callback) {
+    auto buf_ptr = buffer.data();
+    auto buf_size = buffer.size();
     auto send_future_obj = nb::cast(
         new ClientSendFuture(this, nullptr, done_callback, fail_callback));
-    auto send_future = nb::inst_ptr<ClientSendFuture>(send_future_obj);
-    // wait for todo release
     {
       nb::gil_scoped_release release;
-      uint8_t expected{0};
-      for (;;) {
-        if (todo_.compare_exchange_weak(expected, 1,
-                                        std::memory_order_acq_rel)) {
-          break;
-        }
-        while (todo_.load(std::memory_order_acquire) != 0) {
-          std::this_thread::yield();
-        }
-      }
+      send_q_.wait_emplace([&](auto &dst) {
+        nb::gil_scoped_acquire acquire;
+        dst.emplace(send_future_obj, tag, buf_size, buf_ptr);
+      });
     }
-    todo_content_ =
-        std::make_tuple(send_future_obj, tag, buffer.data(), buffer.size());
-    todo_.store(2, std::memory_order_release);
-    // spin until pick up
-    // {
-    //   nb::gil_scoped_release release;
-    //   while (frame->todo_.load(std::memory_order_acquire) == 2) {
-    //     std::this_thread::yield();
-    //   }
-    // }
-    return send_future;
+  }
+  auto recv(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> &buffer,
+            uint64_t tag, uint64_t tag_mask, nb::object done_callback,
+            nb::object fail_callback) {
+    auto buf_ptr = buffer.data();
+    auto buf_size = buffer.size();
+    auto recv_future = new ClientRecvFuture(this, done_callback, fail_callback);
+    auto recv_future_obj = nb::cast(recv_future);
+    {
+      nb::gil_scoped_release release;
+      recv_q_.wait_emplace([&](auto &dst) {
+        dst.emplace(recv_future_obj, tag, tag_mask, buf_size, buf_ptr);
+      });
+    }
   }
   void init_context() {
     ucp_params_t params{
@@ -169,39 +293,55 @@ struct Client {
     init_worker();
     init_sock_ep(addr, port);
     while (!closed_.load(std::memory_order_acquire)) {
-      while (ucp_worker_progress(worker_) > 0) {
-        debug_print("Client made some progress");
-      }
-      auto cur_todo = todo_.load(std::memory_order_acquire);
-      if (cur_todo == 2) {
-        static size_t received{0};
+      ucp_worker_progress(worker_);
+      send_q_.try_consume([this](auto &&src) {
         nb::gil_scoped_acquire acquire;
-        received++;
-        debug_print("Total Client received send request: {}", received);
-        auto [send_future_obj, tag, buf_ptr, buf_size] = todo_content_;
-        todo_content_ = {};
-        todo_.store(0, std::memory_order_release);
-        auto send_future = nb::inst_ptr<ClientSendFuture>(send_future_obj);
-
+        ClientSendPack const &pack = src.value();
+        auto send_future = nb::inst_ptr<ClientSendFuture>(pack.send_future);
         ucp_request_param_t send_param{.op_attr_mask =
                                            UCP_OP_ATTR_FIELD_CALLBACK |
                                            UCP_OP_ATTR_FIELD_USER_DATA,
                                        .cb{.send = send_cb},
                                        .user_data = send_future};
-        auto *req = ucp_tag_send_nbx(ep_, buf_ptr, buf_size, tag, &send_param);
+        auto *req = ucp_tag_send_nbx(ep_, pack.buf_ptr, pack.buf_size, pack.tag,
+                                     &send_param);
         if (UCS_PTR_STATUS(req) == UCS_OK) {
-          // completed immediately
-          debug_print("Req done immediately.");
           send_future->set_result(UCS_OK);
         } else if (UCS_PTR_IS_ERR(req)) {
-          debug_print("Req fail immediately.");
           send_future->set_result(UCS_PTR_STATUS(req));
         } else {
           send_future->req_ = req;
-          sends_.insert(send_future_obj);
+          sends_.insert(std::move(pack.send_future));
         }
-        debug_print("Worker handled send request.");
-      }
+        src.reset();
+      });
+      recv_q_.try_consume([this](auto &&src) {
+        nb::gil_scoped_acquire acquire;
+        ClientRecvPack const &pack = src.value();
+        auto recv_future = nb::inst_ptr<ClientRecvFuture>(pack.recv_future);
+        ucp_tag_recv_info_t tag_info{};
+        ucp_request_param_t param{.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                                                  UCP_OP_ATTR_FIELD_USER_DATA |
+                                                  UCP_OP_ATTR_FIELD_RECV_INFO,
+                                  .cb{.recv = recv_cb},
+                                  .user_data = recv_future,
+                                  .recv_info{
+                                      .tag_info = &tag_info,
+                                  }};
+        auto req = ucp_tag_recv_nbx(worker_, pack.buf_ptr, pack.buf_size,
+                                    pack.tag, pack.tag_mask, &param);
+        if (req == NULL) {
+          recv_future->sender_tag_ = tag_info.sender_tag;
+          recv_future->length_ = tag_info.length;
+          recv_future->set_result(UCS_OK);
+        } else if (UCS_PTR_IS_ERR(req)) {
+          recv_future->set_result(UCS_PTR_STATUS(req));
+        } else {
+          recv_future->req_ = req;
+          recv_reqs_.insert(std::move(pack.recv_future));
+        }
+        src.reset();
+      });
     }
     debug_print("Start closing flush...");
     while (ucp_worker_progress(worker_) > 0) {
@@ -213,7 +353,17 @@ struct Client {
       nb::gil_scoped_acquire acquire;
       for (auto const &_req : sends_) {
         auto req = nb::inst_ptr<ClientSendFuture>(_req);
-        if (ucp_request_check_status(req) == UCS_INPROGRESS) {
+        if (ucp_request_check_status(req->req_) == UCS_INPROGRESS) {
+          ucp_request_cancel(worker_, req->req_);
+          debug_print("Some request cancelled.");
+        }
+      }
+    }
+    {
+      nb::gil_scoped_acquire acquire;
+      for (auto const &_req : recv_reqs_) {
+        auto req = nb::inst_ptr<ClientRecvFuture>(_req);
+        if (ucp_request_check_status(req->req_) == UCS_INPROGRESS) {
           ucp_request_cancel(worker_, req->req_);
           debug_print("Some request cancelled.");
         }
@@ -267,6 +417,22 @@ struct Client {
     debug_print("Cleanup done.");
     closed_.store(false, std::memory_order_release);
   }
+  static void recv_cb(void *request, ucs_status_t status,
+                      ucp_tag_recv_info_t const *info, void *args) {
+    auto *recv_future = reinterpret_cast<ClientRecvFuture *>(args);
+    {
+      nb::gil_scoped_acquire acquire;
+      auto obj = nb::find(recv_future);
+      assert(obj.is_valid());
+      recv_future->sender_tag_ = info->sender_tag;
+      recv_future->length_ = info->length;
+      assert(recv_future->req_ == request);
+      recv_future->req_ = NULL;
+      recv_future->set_result(status);
+      recv_future->client_->recv_reqs_.erase(obj);
+    }
+    ucp_request_free(request);
+  }
   static void send_cb(void *req, ucs_status_t status, void *user_data) {
     auto *future = reinterpret_cast<ClientSendFuture *>(user_data);
     {
@@ -286,17 +452,64 @@ struct Client {
   ucp_ep_h ep_;
 
   std::atomic<bool> closed_{false};
-  std::atomic<uint8_t> todo_{false}; // 0: spare 1: loading 2 : loaded
-  std::tuple<nb::object, uint64_t, uint8_t *, size_t> todo_content_{};
+  Channel<ClientSendPack> send_q_{};
+  Channel<ClientRecvPack> recv_q_{};
+
   std::set<nb::object,
            decltype([](nb::object const &lhs, nb::object const &rhs) {
              return lhs.ptr() < rhs.ptr();
            })>
       sends_{};
+  std::set<nb::object,
+           decltype([](nb::object const &lhs, nb::object const &rhs) {
+             return lhs.ptr() < rhs.ptr();
+           })>
+      recv_reqs_{};
 };
 
 // Server
 struct Server;
+struct ServerSendFuture {
+  ServerSendFuture(Server *server, void *req, nb::object done_callback,
+                   nb::object fail_callback)
+      : server_(server), req_(req), done_callback_(done_callback),
+        fail_callback_(fail_callback) {}
+  ServerSendFuture(ServerSendFuture const &) = delete;
+  auto operator=(ServerSendFuture const &) -> ServerSendFuture & = delete;
+  [[nodiscard]] auto done() const noexcept -> bool { return done_; }
+  auto exception() {
+    if (done_status_ == UCS_OK) {
+      return "";
+    }
+    return ucs_status_string(done_status_);
+  }
+  void set_result(ucs_status_t status) {
+    done_status_ = status;
+    done_.store(true, std::memory_order_release);
+    if (done_status_ == UCS_OK) {
+      nb::handle obj = nb::find(this);
+      debug_print("Done obj name {}, valid {}", nb::inst_name(obj).c_str(),
+                  obj.is_valid());
+      done_callback_(obj);
+    } else {
+      nb::handle obj = nb::find(this);
+      assert(obj.is_valid());
+      fail_callback_(obj);
+    }
+  }
+  void wait() {
+    while (!done_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  }
+  auto server() const { return server_; }
+
+  std::atomic<bool> done_{false};
+  Server *server_;
+  void *req_;
+  ucs_status_t done_status_{UCS_OK};
+  nb::object done_callback_, fail_callback_;
+};
 struct ServerRecvFuture {
   ServerRecvFuture(Server *server, nb::object done_callback,
                    nb::object fail_callback)
@@ -331,6 +544,19 @@ struct ServerRecvFuture {
   Server *server_;
   uint64_t sender_tag_{};
   size_t length_{};
+};
+struct ServerRecvPack {
+  nb::object recv_future;
+  uint64_t tag, tag_mask;
+  size_t buf_size;
+  uint8_t *buf_ptr;
+};
+struct ServerSendPack {
+  nb::object send_future;
+  uintptr_t dst_ep;
+  uint64_t tag;
+  size_t buf_size;
+  uint8_t *buf_ptr;
 };
 struct Server {
   void init_context() {
@@ -379,29 +605,36 @@ struct Server {
     auto recv_future = new ServerRecvFuture(this, done_callback, fail_callback);
     auto recv_future_obj = nb::cast(recv_future);
     {
-      // block until free
       nb::gil_scoped_release release;
-      uint8_t expected{0};
-      for (;;) {
-        if (to_recv_.compare_exchange_weak(expected, 1,
-                                           std::memory_order_acq_rel)) {
-          break;
-        }
-        while (to_recv_.load(std::memory_order_acquire) != 0) {
-          std::this_thread::yield();
-        }
-      }
+      recv_q_.wait_emplace([&](auto &dst) {
+        nb::gil_scoped_acquire acquire;
+        dst.emplace(recv_future_obj, tag, tag_mask, buf_size, buf_ptr);
+      });
+      return;
     }
-    recv_args_ =
-        std::make_tuple(recv_future_obj, buf_ptr, buf_size, tag, tag_mask);
-    to_recv_.store(2, std::memory_order_release);
-    // wait until consumed
-    // {
-    //   nb::gil_scoped_release release;
-    //   while (to_recv_.load(std::memory_order_acquire) == 2) {
-    //   }
-    // }
-    return recv_future_obj;
+  }
+  auto list_clients() -> std::vector<uintptr_t> {
+    std::vector<uintptr_t> clients;
+    for (auto ep : connected_) {
+      clients.push_back(reinterpret_cast<uintptr_t>(ep));
+    }
+    return clients;
+  }
+  auto send(uintptr_t client_ep,
+            nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> &buffer,
+            uint64_t tag, nb::object done_callback, nb::object fail_callback) {
+    auto buf_ptr = buffer.data();
+    auto buf_size = buffer.size();
+    auto send_future_obj = nb::cast(
+        new ServerSendFuture(this, nullptr, done_callback, fail_callback));
+    {
+      nb::gil_scoped_release release;
+      send_q_.wait_emplace([&](auto &dst) {
+        dst.emplace(send_future_obj, reinterpret_cast<uintptr_t>(client_ep),
+                    tag, buf_size, buf_ptr);
+      });
+      return;
+    }
   }
   Server(std::string_view addr, uint64_t port)
       : worker_thread_(
@@ -421,6 +654,18 @@ struct Server {
     }
     worker_thread_.join();
     debug_print("Close done in main.");
+  }
+  static void send_cb(void *req, ucs_status_t status, void *user_data) {
+    auto *future = reinterpret_cast<ServerSendFuture *>(user_data);
+    {
+      nb::gil_scoped_acquire acquire;
+      nb::object obj = nb::find(future);
+      assert(obj.is_valid());
+      future->set_result(status);
+      future->server()->send_reqs_.erase(obj);
+    }
+    // free the request
+    ucp_request_free(req);
   }
   static void recv_cb(void *request, ucs_status_t status,
                       ucp_tag_recv_info_t const *info, void *args) {
@@ -445,16 +690,11 @@ struct Server {
     init_listener(addr, port);
     closed_.store(false, std::memory_order_release);
     while (!closed_.load(std::memory_order_acquire)) {
-      while (ucp_worker_progress(worker_) > 0) {
-      }
-      if (to_recv_.load(std::memory_order_acquire) == 2) {
-        static size_t received{0};
+      ucp_worker_progress(worker_);
+      recv_q_.try_consume([&](auto &&src) {
         nb::gil_scoped_acquire acquire;
-        debug_print("Worker got something to recv. Total: {}", ++received);
-        auto [recv_future_obj, buf_ptr, buf_size, tag, tag_mask] = recv_args_;
-        recv_args_ = {};
-        to_recv_.store(0, std::memory_order_release);
-        auto recv_future = nb::inst_ptr<ServerRecvFuture>(recv_future_obj);
+        auto const &pack = src.value();
+        auto recv_future = nb::inst_ptr<ServerRecvFuture>(pack.recv_future);
         ucp_tag_recv_info_t tag_info{};
         ucp_request_param_t param{.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
                                                   UCP_OP_ATTR_FIELD_USER_DATA |
@@ -464,25 +704,49 @@ struct Server {
                                   .recv_info{
                                       .tag_info = &tag_info,
                                   }};
-        auto status =
-            ucp_tag_recv_nbx(worker_, buf_ptr, buf_size, tag, tag_mask, &param);
+        auto status = ucp_tag_recv_nbx(worker_, pack.buf_ptr, pack.buf_size,
+                                       pack.tag, pack.tag_mask, &param);
         if (status == NULL) {
-          // immediately done
           recv_future->sender_tag_ = tag_info.sender_tag;
           recv_future->length_ = tag_info.length;
           recv_future->set_result(UCS_OK);
         } else if (UCS_PTR_IS_ERR(status)) {
           recv_future->set_result(UCS_PTR_STATUS(status));
         } else {
-          nb::gil_scoped_acquire acquire;
           recv_future->req_ = status;
-          recv_reqs_.insert(recv_future_obj);
+          recv_reqs_.insert(pack.recv_future);
         }
-      }
+        src.reset();
+      });
+
+      send_q_.try_consume([&](auto &&src) {
+        nb::gil_scoped_acquire acquire;
+        ServerSendPack const &pack = src.value();
+        auto send_future = nb::inst_ptr<ServerSendFuture>(pack.send_future);
+
+        ucp_request_param_t send_param{.op_attr_mask =
+                                           UCP_OP_ATTR_FIELD_CALLBACK |
+                                           UCP_OP_ATTR_FIELD_USER_DATA,
+                                       .cb{.send = send_cb},
+                                       .user_data = send_future};
+        auto *req = ucp_tag_send_nbx(reinterpret_cast<ucp_ep_h>(pack.dst_ep),
+                                     pack.buf_ptr, pack.buf_size, pack.tag,
+                                     &send_param);
+        if (UCS_PTR_STATUS(req) == UCS_OK) {
+          send_future->set_result(UCS_OK);
+        } else if (UCS_PTR_IS_ERR(req)) {
+          send_future->set_result(UCS_PTR_STATUS(req));
+        } else {
+          send_future->req_ = req;
+          send_reqs_.insert(std::move(pack.send_future));
+        }
+        src.reset();
+      });
     }
     // detect closed, cancel all outgoing reqs
     debug_print("Detect close in worker thread.");
-    debug_print("Hangling requests: {}", recv_reqs_.size());
+    debug_print("Hangling recv requests: {}", recv_reqs_.size());
+    debug_print("Hangling send requests: {}", send_reqs_.size());
 
     {
       nb::gil_scoped_acquire acquire;
@@ -494,6 +758,16 @@ struct Server {
         }
       }
     }
+    {
+      nb::gil_scoped_acquire acquire;
+      for (auto _req : send_reqs_) {
+        auto req = nb::inst_ptr<ServerSendFuture>(_req);
+        if (ucp_request_check_status(req->req_) == UCS_INPROGRESS) {
+          ucp_request_cancel(worker_, req->req_);
+          debug_print("Some send request cancelled.");
+        }
+      }
+    }
     while (ucp_worker_progress(worker_) > 0) {
     }
 
@@ -501,6 +775,7 @@ struct Server {
       // additional safe guard to clean ref counts
       nb::gil_scoped_acquire acquire;
       recv_reqs_.clear();
+      send_reqs_.clear();
     }
     // close all eps
     for (auto ep : connected_) {
@@ -543,8 +818,13 @@ struct Server {
              return lhs.ptr() < rhs.ptr();
            })>
       recv_reqs_;
-  std::atomic<uint8_t> to_recv_{0};
-  std::tuple<nb::object, uint8_t *, size_t, uint64_t, uint64_t> recv_args_{};
+  std::set<nb::object,
+           decltype([](nb::object const &lhs, nb::object const &rhs) {
+             return lhs.ptr() < rhs.ptr();
+           })>
+      send_reqs_;
+  Channel<ServerRecvPack> recv_q_;
+  Channel<ServerSendPack> send_q_;
 };
 
 int client_send_future_wrapper_tp_traverse(PyObject *self, visitproc visit,
@@ -595,6 +875,58 @@ PyType_Slot client_send_future_wrapper_slots[] = {
     {Py_tp_clear, (void *)client_send_future_wrapper_tp_clear},
     {0, 0}};
 
+int client_recv_future_wrapper_tp_traverse(PyObject *self, visitproc visit,
+                                           void *arg) {
+#if PY_VERSION_HEX >= 0x03090000
+  Py_VISIT(Py_TYPE(self));
+#endif
+  if (!nb::inst_ready(self)) {
+    return 0;
+  }
+  ClientRecvFuture *w = nb::inst_ptr<ClientRecvFuture>(self);
+  nb::handle value = nb::find(w->done_callback_);
+  Py_VISIT(value.ptr());
+  nb::handle value2 = nb::find(w->fail_callback_);
+  Py_VISIT(value2.ptr());
+  return 0;
+}
+int client_recv_future_wrapper_tp_clear(PyObject *self) {
+  ClientRecvFuture *w = nb::inst_ptr<ClientRecvFuture>(self);
+  w->done_callback_ = {};
+  w->fail_callback_ = {};
+  return 0;
+}
+PyType_Slot client_recv_future_wrapper_slots[] = {
+    {Py_tp_traverse, (void *)client_recv_future_wrapper_tp_traverse},
+    {Py_tp_clear, (void *)client_recv_future_wrapper_tp_clear},
+    {0, 0}};
+
+int server_send_future_wrapper_tp_traverse(PyObject *self, visitproc visit,
+                                           void *arg) {
+#if PY_VERSION_HEX >= 0x03090000
+  Py_VISIT(Py_TYPE(self));
+#endif
+  if (!nb::inst_ready(self)) {
+    return 0;
+  }
+  ServerSendFuture *w = nb::inst_ptr<ServerSendFuture>(self);
+  nb::handle value = nb::find(w->done_callback_);
+  Py_VISIT(value.ptr());
+  nb::handle value2 = nb::find(w->fail_callback_);
+  Py_VISIT(value2.ptr());
+  return 0;
+}
+int server_send_future_wrapper_tp_clear(PyObject *self) {
+  ServerSendFuture *w = nb::inst_ptr<ServerSendFuture>(self);
+  w->done_callback_ = {};
+  w->fail_callback_ = {};
+  return 0;
+}
+PyType_Slot server_send_future_wrapper_slots[] = {
+    {Py_tp_traverse, (void *)server_send_future_wrapper_tp_traverse},
+    {Py_tp_clear, (void *)server_send_future_wrapper_tp_clear},
+    {0, 0}};
+
 int server_recv_future_wrapper_tp_traverse(PyObject *self, visitproc visit,
                                            void *arg) {
 #if PY_VERSION_HEX >= 0x03090000
@@ -632,15 +964,25 @@ int server_wrapper_tp_traverse(PyObject *self, visitproc visit, void *arg) {
   for (auto req : w->recv_reqs_) {
     Py_VISIT(req.ptr());
   }
-  auto const &recv_ref = std::get<0>(w->recv_args_);
-  nb::handle recv_ref_obj = nb::find(recv_ref);
-  Py_VISIT(recv_ref_obj.ptr());
+  for (auto req : w->send_reqs_) {
+    Py_VISIT(req.ptr());
+  }
+  if(w->recv_q_.data.has_value()) {
+    Py_VISIT(w->recv_q_.data->recv_future.ptr());
+  }
+  if(w->send_q_.data.has_value()) {
+    Py_VISIT(w->send_q_.data->send_future.ptr());
+  }
   return 0;
 }
 int server_wrapper_tp_clear(PyObject *self) {
   auto *w = nb::inst_ptr<Server>(self);
   w->recv_reqs_.clear();
-  w->recv_args_ = {};
+  w->send_reqs_.clear();
+  w->recv_q_.data.reset();
+  w->send_q_.data.reset();
+  w->recv_q_.status.store(0, std::memory_order_release);
+  w->send_q_.status.store(0, std::memory_order_release);
   return 0;
 }
 PyType_Slot server_wrapper_slots[] = {
@@ -658,15 +1000,25 @@ int client_wrapper_tp_traverse(PyObject *self, visitproc visit, void *arg) {
   for (auto const &send : w->sends_) {
     Py_VISIT(send.ptr());
   }
-  auto const &todo_ref = std::get<0>(w->todo_content_);
-  nb::handle todo_obj = nb::find(todo_ref);
-  Py_VISIT(todo_obj.ptr());
+  for (auto const &recv : w->recv_reqs_) {
+    Py_VISIT(recv.ptr());
+  }
+  if (w->send_q_.data.has_value()) {
+    Py_VISIT(w->send_q_.data.value().send_future.ptr());
+  }
+  if (w->recv_q_.data.has_value()) {
+    Py_VISIT(w->recv_q_.data.value().recv_future.ptr());
+  }
   return 0;
 }
 int client_wrapper_tp_clear(PyObject *self) {
   auto *w = nb::inst_ptr<Client>(self);
-  w->todo_content_ = {};
   w->sends_.clear();
+  w->recv_reqs_.clear();
+  w->send_q_.data.reset();
+  w->send_q_.status.store(0, std::memory_order_release);
+  w->recv_q_.data.reset();
+  w->recv_q_.status.store(0, std::memory_order_release);
   return 0;
 }
 PyType_Slot client_wrapper_slots[] = {
@@ -682,10 +1034,27 @@ NB_MODULE(_bindings, m) {
            nb::call_guard<nb::gil_scoped_release>())
       .def("exception", &ClientSendFuture::exception);
 
+  nb::class_<ClientRecvFuture>(m, "ClientRecvFuture",
+                               nb::type_slots(client_recv_future_wrapper_slots))
+      .def("done", &ClientRecvFuture::done)
+      .def("exception", &ClientRecvFuture::exception)
+      .def("info", &ClientRecvFuture::info)
+      .def("wait", &ClientRecvFuture::wait,
+           nb::call_guard<nb::gil_scoped_release>());
+
   nb::class_<Client>(m, "Client", nb::type_slots(client_wrapper_slots))
       .def(nb::init<std::string_view, uint64_t>(), "addr"_a, "port"_a)
       .def("send", &Client::send, "buffer"_a, "tag"_a, "done_callback"_a,
-           "fail_callback"_a);
+           "fail_callback"_a)
+      .def("recv", &Client::recv, "buffer"_a, "tag"_a, "tag_mask"_a,
+           "done_callback"_a, "fail_callback"_a);
+
+  nb::class_<ServerSendFuture>(m, "ServerSendFuture",
+                               nb::type_slots(server_send_future_wrapper_slots))
+      .def("done", &ServerSendFuture::done)
+      .def("wait", &ServerSendFuture::wait,
+           nb::call_guard<nb::gil_scoped_release>())
+      .def("exception", &ServerSendFuture::exception);
 
   nb::class_<ServerRecvFuture>(m, "ServerRecvFuture",
                                nb::type_slots(server_recv_future_wrapper_slots))
@@ -698,5 +1067,8 @@ NB_MODULE(_bindings, m) {
   nb::class_<Server>(m, "Server", nb::type_slots(server_wrapper_slots))
       .def(nb::init<std::string_view, uint64_t>(), "addr"_a, "port"_a)
       .def("recv", &Server::recv, "buffer"_a, "tag"_a, "tag_mask"_a,
+           "done_callback"_a, "fail_callback"_a)
+      .def("list_clients", &Server::list_clients)
+      .def("send", &Server::send, "client_ep"_a, "buffer"_a, "tag"_a,
            "done_callback"_a, "fail_callback"_a);
 }
