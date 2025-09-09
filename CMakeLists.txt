@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.31)
 
-project(starway VERSION 0.1.4 LANGUAGES CXX) # Replace 'my_project' with the name of your project
+project(starway VERSION 0.2.1 LANGUAGES CXX) # Replace 'my_project' with the name of your project
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 23)
