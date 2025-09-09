@@ -8,9 +8,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ._bindings import Client as _Client
+from ._bindings import ClientRecvFuture as _ClientRecvFuture
 from ._bindings import ClientSendFuture as _ClientSendFuture
 from ._bindings import Server as _Server
 from ._bindings import ServerRecvFuture as _ServerRecvFuture
+from ._bindings import ServerSendFuture as _ServerSendFuture
 
 
 @overload
@@ -48,7 +50,7 @@ class SendFuture:
         self._done = False
         self._exception = None
 
-    def _set_inner(self, inner: _ClientSendFuture):
+    def _set_inner(self, inner: _ClientSendFuture | _ServerSendFuture):
         self._inner = inner
 
     def add_done_callback(self, callback: Callable[[SendFuture], None]):
@@ -86,7 +88,7 @@ class RecvFuture:
         self._exception = None
         self._result: tuple[int, int] | None = None
 
-    def _set_inner(self, inner: _ServerRecvFuture):
+    def _set_inner(self, inner: _ServerRecvFuture | _ClientRecvFuture):
         self._inner = inner
 
     def add_done_callback(self, callback: Callable[[RecvFuture], None]):
@@ -121,6 +123,56 @@ class RecvFuture:
 class Server:
     def __init__(self, addr: str, port: int):
         self._server = _Server(addr, port)
+
+    def list_clients(self):
+        return self._server.list_clients()
+
+    def send(
+        self,
+        client_ep: int,
+        buffer: Annotated[NDArray[np.uint8], dict(shape=(None,), device="cpu")],
+        tag: int,
+    ):
+        ret = SendFuture()
+
+        def cur_send(future: _ServerSendFuture):
+            ret.set_result()
+
+        def cur_fail(future: _ServerSendFuture):
+            ret.set_exception(Exception(future.exception()))
+
+        inner = self._server.send(client_ep, buffer, tag, cur_send, cur_fail)
+        ret._set_inner(inner)
+        return ret
+
+    def asend(
+        self,
+        client_ep: int,
+        buffer: Annotated[NDArray[np.uint8], dict(shape=(None,), device="cpu")],
+        tag: int,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> asyncio.Future[None]:
+        if loop is None:
+            loop = asyncio.get_running_loop()
+        ret = asyncio.Future(loop=loop)
+
+        def cur_send(future: _ServerSendFuture):
+            ret.get_loop().call_soon_threadsafe(ret.set_result, None)
+
+        def cur_fail(future: _ServerSendFuture):
+            ret.get_loop().call_soon_threadsafe(
+                ret.set_exception, Exception(future.exception())
+            )
+
+        inner = self._server.send(client_ep, buffer, tag, cur_send, cur_fail)
+
+        def capture_inner(x):
+            nonlocal inner
+            del inner
+
+        # this callback does nothing, just capture inner future  to keep it alive
+        ret.add_done_callback(capture_inner)
+        return ret
 
     def recv(
         self,
@@ -189,6 +241,53 @@ class Client:
 
         inner = self._client.send(buffer, tag, cur_send, cur_fail)
         ret._set_inner(inner)
+        return ret
+
+    def recv(
+        self,
+        buffer: Annotated[NDArray[np.uint8], dict(shape=(None,), device="cpu")],
+        tag: int,
+        tag_mask: int,
+    ):
+        ret = RecvFuture()
+
+        def cur_recv(future: _ClientRecvFuture):
+            ret.set_result(future.info())
+
+        def cur_fail(future: _ClientRecvFuture):
+            ret.set_exception(Exception(future.exception()))
+
+        inner = self._client.recv(buffer, tag, tag_mask, cur_recv, cur_fail)
+        ret._set_inner(inner)
+        return ret
+
+    def arecv(
+        self,
+        buffer: Annotated[NDArray[np.uint8], dict(shape=(None,), device="cpu")],
+        tag: int,
+        tag_mask: int,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> asyncio.Future[tuple[int, int]]:
+        if loop is None:
+            loop = asyncio.get_running_loop()
+        ret = asyncio.Future(loop=loop)
+
+        def cur_send(future: _ClientRecvFuture):
+            ret.get_loop().call_soon_threadsafe(ret.set_result, future.info())
+
+        def cur_fail(future: _ClientRecvFuture):
+            ret.get_loop().call_soon_threadsafe(
+                ret.set_exception, Exception(future.exception())
+            )
+
+        inner = self._client.recv(buffer, tag, tag_mask, cur_send, cur_fail)
+
+        def capture_inner(x):
+            nonlocal inner
+            del inner
+
+        # this callback does nothing, just capture inner future  to keep it alive
+        ret.add_done_callback(capture_inner)
         return ret
 
     def asend(
