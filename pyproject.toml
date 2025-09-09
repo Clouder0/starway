@@ -1,6 +1,6 @@
 [project]
 name = "starway"
-version = "0.2.5"
+version = "0.2.6"
 description = "Starway UCX P2P communication lib."
 readme = "README.md"
 authors = [
@@ -61,6 +61,6 @@ manylinux-x86_64-image = "manylinux_2_34"
 before-all = [
   "yum install -y wget ninja-build cmake libnl3-devel libudev-devel",
   "cd / && curl -L https://github.com/linux-rdma/rdma-core/releases/download/v59.0/rdma-core-59.0.tar.gz -o rdma-core-59.0.tar.gz && tar xf rdma-core-59.0.tar.gz && cd rdma-core-59.0 && cmake -Bbuild -GNinja -DIN_PLACE=0 -DCMAKE_EXPORT_COMPILE_COMMANDS=0  -DCMAKE_BUILD_TYPE=Release  -DENABLE_VALGRIND=0  -DENABLE_STATIC=1  -DNO_MAN_PAGES=1 && cmake --build build -j && cmake --install build",
-  "cd / && curl -L https://github.com/openucx/ucx/releases/download/v1.19.0/ucx-1.19.0.tar.gz -o ucx.tar.gz && tar xf ucx.tar.gz",
-  "cd /ucx-1.19.0 && ./contrib/configure-release --disable-doxygen-doc --disable-doxygen-man --disable-doxygen-html --enable-optimizations --enable-tuning  --enable-devel-headers  --with-avx --with-mlx5 --with-rc --with-ud --with-dc --with-ib-hw-tm --with-dm --with-rdmacm=/usr/local && make -j && make install"
+  "cd / && curl -L https://github.com/openucx/ucx/releases/download/v1.18.1/ucx-1.18.1.tar.gz -o ucx.tar.gz && tar xf ucx.tar.gz",
+  "cd /ucx-1.18.1 && ./contrib/configure-release --disable-doxygen-doc --disable-doxygen-man --disable-doxygen-html --enable-optimizations --enable-tuning  --enable-devel-headers  --with-avx --with-mlx5 --with-rc --with-ud --with-dc --with-ib-hw-tm --with-dm --with-rdmacm=/usr/local && make -j && make install"
 ]
