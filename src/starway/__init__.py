@@ -65,6 +65,7 @@ from ._bindings import (  # type: ignore # noqa: E402
 from ._bindings import (  # type: ignore # noqa: E402
     ServerSendFuture as _ServerSendFuture,
 )
+from ._bindings import ucp_get_version  # type: ignore # noqa: E402
 
 
 def check_sys_libs() -> Literal["system"] | Literal["wheel"]:
@@ -278,6 +279,9 @@ class Server:
         ret.add_done_callback(capture_inner)
         return ret
 
+    def evaluate_perf(self, client_ep: int, msg_size: int) -> int:
+        return self._server.evaluate_perf(client_ep, msg_size)
+
 
 class Client:
     def __init__(self, remote_addr: str, port: int):
@@ -375,6 +379,9 @@ class Client:
         ret.add_done_callback(capture_inner)
         return ret
 
+    def evaluate_perf(self, msg_size: int) -> int:
+        return self._client.evaluate_perf(msg_size)
+
 
 __all__ = [
     "Server",
@@ -383,4 +390,5 @@ __all__ = [
     "RecvFuture",
     "wrap_to_asyncio",
     "check_sys_libs",
+    "ucp_get_version",
 ]

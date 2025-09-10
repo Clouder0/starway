@@ -1,14 +1,21 @@
 import asyncio
+import random
 import time
 
 import numpy as np
+import pytest
 
-from starway import Client, Server
+from starway import Client, Server, ucp_get_version
 
 
-def test_basic():
-    server = Server("127.0.0.1", 12345)
-    client = Client("127.0.0.1", 12345)
+@pytest.fixture
+def port():
+    return random.randint(10000, 60000)
+
+
+def test_basic(port):
+    server = Server("127.0.0.1", port)
+    client = Client("127.0.0.1", port)
     some_buffer = np.arange(12345, dtype=np.uint8)
     recv_buffer = np.empty(12345, np.uint8)
     send_future = client.send(some_buffer, 123)
@@ -20,10 +27,10 @@ def test_basic():
     assert np.allclose(some_buffer, recv_buffer)
 
 
-def test_async():
+def test_async(port):
     async def tester():
-        server = Server("127.0.0.1", 19198)
-        client = Client("127.0.0.1", 19198)
+        server = Server("127.0.0.1", port)
+        client = Client("127.0.0.1", port)
         # concurrent sends
         concurrency = 10
         single_pack = 1024 * 1024 * 10
@@ -95,3 +102,161 @@ def test_async():
             assert np.allclose(server_send_buf[i], server_recv_buf[i])
 
     asyncio.run(tester())
+
+
+def test_client_unconnected(port):
+    Client("127.0.0.1", port)
+
+
+def test_client_unconnected_send(port):
+    client = Client("127.0.0.1", port)
+    arr = np.arange(10, dtype=np.uint8)
+    client.send(arr, 0)
+
+
+def test_client_unconnected_recv(port):
+    client = Client("127.0.0.1", port)
+    arr = np.arange(10, dtype=np.uint8)
+    client.recv(arr, 0, 0xFF)
+
+
+def test_client_unconnected_send_recv(port):
+    client = Client("127.0.0.1", port)
+    arr = np.arange(10, dtype=np.uint8)
+    client.recv(arr, 0, 0xFF)
+    client.send(arr, 1)
+
+
+def test_server_unconnected(port):
+    Server("127.0.0.1", port)
+
+
+def test_server_unconnected_recv(port):
+    server = Server("127.0.0.1", port)
+    arr = np.arange(10, dtype=np.uint8)
+    server.recv(arr, 0, 0xFF)
+
+
+def test_pingpong_server_exit_first(port):
+    server = Server("127.0.0.1", port)
+    client = Client("127.0.0.1", port)
+    send_buf_c = np.arange(10, dtype=np.uint8)
+    send_buf_s = np.arange(10, dtype=np.uint8)
+    recv_buf_c = np.arange(10, dtype=np.uint8)
+    recv_buf_s = np.arange(10, dtype=np.uint8)
+    while len(server.list_clients()) < 1:
+        time.sleep(0.01)
+    server.send(server.list_clients()[0], send_buf_s, 0)
+    server.recv(recv_buf_s, 0, 0)
+    client.send(send_buf_c, 0)
+    client.recv(recv_buf_c, 0, 0)
+    del server
+    del client
+
+
+def test_pingpong_client_exit_first(port):
+    server = Server("127.0.0.1", port)
+    client = Client("127.0.0.1", port)
+    send_buf_c = np.arange(10, dtype=np.uint8)
+    send_buf_s = np.arange(10, dtype=np.uint8)
+    recv_buf_c = np.arange(10, dtype=np.uint8)
+    recv_buf_s = np.arange(10, dtype=np.uint8)
+    while len(server.list_clients()) < 1:
+        time.sleep(0.01)
+    server.send(server.list_clients()[0], send_buf_s, 0)
+    server.recv(recv_buf_s, 0, 0)
+    client.send(send_buf_c, 0)
+    client.recv(recv_buf_c, 0, 0)
+    del client
+    del server
+
+
+def test_client_send_no_recv_client_exit_first(port):
+    server = Server("127.0.0.1", port)
+    client = Client("127.0.0.1", port)
+    send_buf_c = np.arange(10, dtype=np.uint8)
+    while len(server.list_clients()) < 1:
+        time.sleep(0.01)
+    client.send(send_buf_c, 0)
+    del client
+    del server
+
+
+def test_client_send_no_recv_server_exit_first(port):
+    server = Server("127.0.0.1", port)
+    client = Client("127.0.0.1", port)
+    send_buf_c = np.arange(10, dtype=np.uint8)
+    while len(server.list_clients()) < 1:
+        time.sleep(0.01)
+    client.send(send_buf_c, 0)
+    del server
+    del client
+
+
+def test_client_recv_no_send_client_exit_first(port):
+    server = Server("127.0.0.1", port)
+    client = Client("127.0.0.1", port)
+    recv_buf_c = np.arange(10, dtype=np.uint8)
+    while len(server.list_clients()) < 1:
+        time.sleep(0.01)
+    client.recv(recv_buf_c, 0, 0)
+    del client
+    del server
+
+
+def test_client_recv_no_send_server_exit_first(port):
+    server = Server("127.0.0.1", port)
+    client = Client("127.0.0.1", port)
+    recv_buf_c = np.arange(10, dtype=np.uint8)
+    while len(server.list_clients()) < 1:
+        time.sleep(0.01)
+    client.recv(recv_buf_c, 0, 0)
+    del server
+    del client
+
+
+def test_server_recv_no_send_client_exit_first(port):
+    server = Server("127.0.0.1", port)
+    client = Client("127.0.0.1", port)
+    recv_buf_c = np.arange(10, dtype=np.uint8)
+    while len(server.list_clients()) < 1:
+        time.sleep(0.01)
+    server.recv(recv_buf_c, 0, 0)
+    del client
+    del server
+
+
+def test_server_recv_no_send_server_exit_first(port):
+    server = Server("127.0.0.1", port)
+    client = Client("127.0.0.1", port)
+    recv_buf_c = np.arange(10, dtype=np.uint8)
+    while len(server.list_clients()) < 1:
+        time.sleep(0.01)
+    server.recv(recv_buf_c, 0, 0)
+    del server
+    del client
+
+
+def test_server_send_no_recv_client_exit_first(port):
+    server = Server("127.0.0.1", port)
+    client = Client("127.0.0.1", port)
+    send_buf_c = np.arange(10, dtype=np.uint8)
+    while len(server.list_clients()) < 1:
+        time.sleep(0.01)
+    server.send(server.list_clients()[0], send_buf_c, 0)
+    del client
+    del server
+
+
+def test_server_send_no_recv_server_exit_first(port):
+    server = Server("127.0.0.1", port)
+    client = Client("127.0.0.1", port)
+    send_buf_c = np.arange(10, dtype=np.uint8)
+    while len(server.list_clients()) < 1:
+        time.sleep(0.01)
+    server.send(server.list_clients()[0], send_buf_c, 0)
+    del server
+    del client
+
+def test_ucp_get_version():
+    ucp_get_version()

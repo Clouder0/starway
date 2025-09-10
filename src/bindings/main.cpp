@@ -1,3 +1,4 @@
+#include "ucp/api/ucp_def.h"
 #include <arpa/inet.h>
 #include <array>
 #include <atomic>
@@ -230,13 +231,9 @@ struct Client {
   }
   ~Client() {
     nb::gil_scoped_release release;
-    debug_print("Start to destroy Client.");
+    debug_print("Client: Start to destroy Client.");
     closed_.store(true, std::memory_order_release);
-    debug_print("Close sent.");
     // wait for it to close
-    while (closed_.load(std::memory_order_acquire)) {
-      std::this_thread::yield();
-    }
     worker_thread_.join();
   }
   auto send(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> &buffer,
@@ -264,16 +261,17 @@ struct Client {
     {
       nb::gil_scoped_release release;
       recv_q_.wait_emplace([&](auto &dst) {
+        nb::gil_scoped_acquire acquire;
         dst.emplace(recv_future_obj, tag, tag_mask, buf_size, buf_ptr);
       });
       return recv_future_obj;
     }
   }
   void init_context() {
-    ucp_params_t params{
-        .field_mask = UCP_PARAM_FIELD_FEATURES,
-        .features = UCP_FEATURE_TAG,
-    };
+    ucp_params_t params{.field_mask = UCP_PARAM_FIELD_FEATURES |
+                                      UCP_PARAM_FIELD_ESTIMATED_NUM_EPS,
+                        .features = UCP_FEATURE_TAG,
+                        .estimated_num_eps = 1};
     ucp_check_status(ucp_init(&params, NULL, &context_),
                      "Failed to init UCP context");
   }
@@ -292,7 +290,9 @@ struct Client {
         .sin_addr = {inet_addr(addr.data())},
     };
     ucp_ep_params_t ep_params{
-        .field_mask = UCP_EP_PARAM_FIELD_FLAGS | UCP_EP_PARAM_FIELD_SOCK_ADDR,
+        .field_mask = UCP_EP_PARAM_FIELD_FLAGS | UCP_EP_PARAM_FIELD_SOCK_ADDR |
+                      UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE,
+        .err_mode = UCP_ERR_HANDLING_MODE_NONE,
         .flags = UCP_EP_PARAMS_FLAGS_CLIENT_SERVER,
         .sockaddr =
             {
@@ -302,6 +302,13 @@ struct Client {
     };
     ucp_check_status(ucp_ep_create(worker_, &ep_params, &ep_),
                      "Failed to create UCP endpoint");
+  }
+  auto evaluate_perf(size_t msg_size) {
+    perf_msg_size_.store(msg_size, std::memory_order_release);
+    while (perf_msg_size_.load(std::memory_order_acquire) > 0) {
+      std::this_thread::yield();
+    }
+    return perf_result_;
   }
   void working_thread(std::string_view addr, uint64_t port) {
     init_context();
@@ -357,79 +364,116 @@ struct Client {
         }
         src.reset();
       });
-    }
-    debug_print("Start closing flush...");
-    while (ucp_worker_progress(worker_) > 0) {
-      debug_print("Client made some progress");
-    }
-
-    debug_print("Start cancelling all requests...");
-    {
-      nb::gil_scoped_acquire acquire;
-      for (auto const &_req : sends_) {
-        auto req = nb::inst_ptr<ClientSendFuture>(_req);
-        if (ucp_request_check_status(req->req_) == UCS_INPROGRESS) {
-          ucp_request_cancel(worker_, req->req_);
-          debug_print("Some request cancelled.");
+      {
+        auto msg_size = perf_msg_size_.load(std::memory_order_acquire);
+        if (msg_size != 0) {
+          debug_print("Client: start perf evaluation with msg size {}...",
+                      msg_size);
+          ucp_ep_evaluate_perf_param_t params{
+              .field_mask = UCP_EP_PERF_PARAM_FIELD_MESSAGE_SIZE,
+              .message_size = msg_size};
+          ucp_ep_evaluate_perf_attr_t out{
+              .field_mask = UCP_EP_PERF_ATTR_FIELD_ESTIMATED_TIME};
+          auto status = ucp_ep_evaluate_perf(ep_, &params, &out);
+          if (status != UCS_OK) [[unlikely]] {
+            throw std::runtime_error(ucs_status_string(status));
+          }
+          perf_result_ = out.estimated_time;
+          perf_msg_size_.store(0, std::memory_order_release);
         }
       }
     }
-    {
-      nb::gil_scoped_acquire acquire;
-      for (auto const &_req : recv_reqs_) {
-        auto req = nb::inst_ptr<ClientRecvFuture>(_req);
-        if (ucp_request_check_status(req->req_) == UCS_INPROGRESS) {
-          ucp_request_cancel(worker_, req->req_);
-          debug_print("Some request cancelled.");
-        }
-      }
-    }
+    debug_print("Client: Start closing flush...");
+    // while (ucp_worker_progress(worker_) > 0) {
+    // debug_print("Client made some progress");
+    // }
+
+    // debug_print("Client: Start cancelling all requests...");
+    // {
+    //   nb::gil_scoped_acquire acquire;
+    //   for (auto const &_req : sends_) {
+    //     debug_print("Client: start cancel one send.");
+    //     auto req = nb::inst_ptr<ClientSendFuture>(_req);
+    //     if (ucp_request_check_status(req->req_) == UCS_INPROGRESS) {
+    //       debug_print("Client: cancel Some send request.");
+    //       ucp_request_cancel(worker_, req->req_);
+    //       debug_print("Client: Some send request cancelled.");
+    //     }
+    //     debug_print("Client: cancel one send done.");
+    //   }
+    //   for (auto const &_req : recv_reqs_) {
+    //     debug_print("Client: start cancel one recv.");
+    //     auto req = nb::inst_ptr<ClientRecvFuture>(_req);
+    //     if (ucp_request_check_status(req->req_) == UCS_INPROGRESS) {
+    //       ucp_request_cancel(worker_, req->req_);
+    //       debug_print("Client: Some request cancelled.");
+    //     }
+    //     debug_print("Client: cancel one recv done.");
+    //   }
+    // }
+    // debug_print("Client: all cancel done.");
     while (ucp_worker_progress(worker_) > 0) {
-      debug_print("Client made some progress");
+      debug_print("Client: Client made some progress");
     }
 
+    // {
+    //   nb::gil_scoped_acquire acquire;
+    //   sends_.clear();
+    //   recv_reqs_.clear();
+    // }
     ucp_request_param_t flush_params{};
-    auto flush_status = ucp_worker_flush_nbx(worker_, &flush_params);
+    auto flush_status = ucp_ep_flush_nbx(ep_, &flush_params);
     if (UCS_PTR_STATUS(flush_status) == UCS_OK) {
-      debug_print("Flush done!");
+      debug_print("Client: Flush done!");
     } else if (UCS_PTR_IS_ERR(flush_status)) {
-      debug_print("Flushed failed! {}",
-                  ucs_status_string(UCS_PTR_STATUS(flush_status)));
+      if (UCS_PTR_STATUS(flush_status) != UCS_ERR_CONNECTION_RESET) {
+        // just ignore CONN RESET, which indicates remote end has been closed
+        debug_print("Client: Flushed failed! {}",
+                    ucs_status_string(UCS_PTR_STATUS(flush_status)));
+      } else {
+        debug_print("Client: Flush done with expected ERR: {}",
+                    ucs_status_string(UCS_PTR_STATUS(flush_status)));
+      }
     } else {
       ucs_status_t flush_req_status{};
       do {
         ucp_worker_progress(worker_);
         flush_req_status = ucp_request_check_status(flush_status);
-        debug_print("Flush req status {}",
-                    static_cast<int64_t>(flush_req_status));
       } while (flush_req_status == UCS_INPROGRESS);
-      debug_print("Flush request done.");
+      debug_print("Client: Flush request done.");
       ucp_request_free(flush_status);
     }
-    debug_print("Flush done. Start sending close...");
 
-    debug_print("Start send close...");
-    ucp_request_param_t close_param{.op_attr_mask = UCP_EP_PARAM_FIELD_FLAGS,
-                                    .flags = UCP_EP_CLOSE_FLAG_FORCE};
+    debug_print("Client: Start sending close...");
+    ucp_request_param_t close_param{};
     auto status = ucp_ep_close_nbx(ep_, &close_param);
     if (UCS_PTR_STATUS(status) == UCS_OK) {
-      debug_print("Close done.");
+      debug_print("Client: Close done.");
     } else if (UCS_PTR_IS_ERR(status)) {
-      debug_print("Close failed: {}",
-                  ucs_status_string(UCS_PTR_STATUS(status)));
+      if (UCS_PTR_STATUS(status) != UCS_ERR_CONNECTION_RESET &&
+          UCS_PTR_STATUS(status) != UCS_ERR_UNREACHABLE &&
+          UCS_PTR_STATUS(status) != UCS_ERR_NOT_CONNECTED) {
+        // just ignore CONN RESET, which indicates remote end has been closed
+        debug_print("Client: Close failed: {}",
+                    ucs_status_string(UCS_PTR_STATUS(status)));
+      } else {
+        debug_print("Client: Close done with expected ERR: {}",
+                    ucs_status_string(UCS_PTR_STATUS(status)));
+      }
     } else {
+      debug_print("Client: async Close, waiting...");
       while (ucp_request_check_status(status) == UCS_INPROGRESS) {
         while (ucp_worker_progress(worker_) > 0) {
         }
       }
-      debug_print("Close request done.");
+      debug_print("Client: Close request done.");
       ucp_request_free(status);
     }
-
+    debug_print("Client: start destroy worker");
     ucp_worker_destroy(worker_);
-    debug_print("Worker thread exit done.");
+    debug_print("Client: Worker thread exit done.");
     ucp_cleanup(context_);
-    debug_print("Cleanup done.");
+    debug_print("Client: Cleanup done.");
     closed_.store(false, std::memory_order_release);
   }
   static void recv_cb(void *request, ucs_status_t status,
@@ -469,6 +513,8 @@ struct Client {
   std::atomic<bool> closed_{false};
   Channel<ClientSendPack> send_q_{};
   Channel<ClientRecvPack> recv_q_{};
+  std::atomic<size_t> perf_msg_size_{0};
+  double perf_result_{0};
 
   std::set<nb::object,
            decltype([](nb::object const &lhs, nb::object const &rhs) {
@@ -645,6 +691,7 @@ struct Server {
     {
       nb::gil_scoped_release release;
       send_q_.wait_emplace([&](auto &dst) {
+        nb::gil_scoped_acquire acquire;
         dst.emplace(send_future_obj, reinterpret_cast<uintptr_t>(client_ep),
                     tag, buf_size, buf_ptr);
       });
@@ -653,22 +700,20 @@ struct Server {
   }
   Server(std::string_view addr, uint64_t port)
       : worker_thread_(
-            [this, addr, port]() { this->wokring_thread(addr, port); }) {
+            [this, addr, port]() { this->working_thread(addr, port); }) {
     nb::gil_scoped_release release;
     // block until thread prepared
     while (closed_.load(std::memory_order_acquire)) {
       std::this_thread::yield();
     }
   }
+
   ~Server() {
     nb::gil_scoped_release release;
     closed_.store(true, std::memory_order_release);
-    debug_print("Send close signal.");
-    while (closed_.load(std::memory_order_acquire)) {
-      std::this_thread::yield();
-    }
+    debug_print("Server: Send close signal.");
     worker_thread_.join();
-    debug_print("Close done in main.");
+    debug_print("Server: Close done in main.");
   }
   static void send_cb(void *req, ucs_status_t status, void *user_data) {
     auto *future = reinterpret_cast<ServerSendFuture *>(user_data);
@@ -698,8 +743,16 @@ struct Server {
     }
     ucp_request_free(request);
   }
+  auto evaluate_perf(uintptr_t client_ep, size_t msg_size) {
+    perf_client_ = client_ep;
+    perf_msg_size_.store(msg_size, std::memory_order_release);
+    while (perf_msg_size_.load(std::memory_order_acquire) > 0) {
+      std::this_thread::yield();
+    }
+    return perf_result_;
+  }
 
-  void wokring_thread(std::string_view addr, uint64_t port) {
+  void working_thread(std::string_view addr, uint64_t port) {
     init_context();
     init_worker();
     init_listener(addr, port);
@@ -757,61 +810,78 @@ struct Server {
         }
         src.reset();
       });
+      {
+        auto msg_size = perf_msg_size_.load(std::memory_order_acquire);
+        if (msg_size != 0) {
+          debug_print("Server: start perf evaluation...");
+          ucp_ep_evaluate_perf_param_t params{
+              .field_mask = UCP_EP_PERF_PARAM_FIELD_MESSAGE_SIZE,
+              .message_size = msg_size};
+          ucp_ep_evaluate_perf_attr_t out{
+              .field_mask = UCP_EP_PERF_ATTR_FIELD_ESTIMATED_TIME};
+          auto status = ucp_ep_evaluate_perf(
+              reinterpret_cast<ucp_ep_h>(perf_client_), &params, &out);
+          if (status != UCS_OK) [[unlikely]] {
+            throw std::runtime_error(ucs_status_string(status));
+          }
+          perf_result_ = out.estimated_time;
+          perf_msg_size_.store(0, std::memory_order_release);
+        }
+      }
     }
     // detect closed, cancel all outgoing reqs
-    debug_print("Detect close in worker thread.");
-    debug_print("Hangling recv requests: {}", recv_reqs_.size());
-    debug_print("Hangling send requests: {}", send_reqs_.size());
+    debug_print("Server: Detect close in worker thread.");
+    debug_print("Server: Hangling recv requests: {}", recv_reqs_.size());
+    debug_print("Server: Hangling send requests: {}", send_reqs_.size());
 
-    {
-      nb::gil_scoped_acquire acquire;
-      for (auto _req : recv_reqs_) {
-        auto req = nb::inst_ptr<ServerRecvFuture>(_req);
-        if (ucp_request_check_status(req->req_) == UCS_INPROGRESS) {
-          ucp_request_cancel(worker_, req->req_);
-          debug_print("Some recv request cancelled.");
-        }
-      }
-    }
-    {
-      nb::gil_scoped_acquire acquire;
-      for (auto _req : send_reqs_) {
-        auto req = nb::inst_ptr<ServerSendFuture>(_req);
-        if (ucp_request_check_status(req->req_) == UCS_INPROGRESS) {
-          ucp_request_cancel(worker_, req->req_);
-          debug_print("Some send request cancelled.");
-        }
-      }
-    }
-    while (ucp_worker_progress(worker_) > 0) {
-    }
+    // {
+    //   nb::gil_scoped_acquire acquire;
+    //   for (auto _req : recv_reqs_) {
+    //     auto req = nb::inst_ptr<ServerRecvFuture>(_req);
+    //     if (ucp_request_check_status(req->req_) == UCS_INPROGRESS) {
+    //       ucp_request_cancel(worker_, req->req_);
+    //       debug_print("Server: Some recv request cancelled.");
+    //     }
+    //   }
+    //   for (auto _req : send_reqs_) {
+    //     auto req = nb::inst_ptr<ServerSendFuture>(_req);
+    //     if (ucp_request_check_status(req->req_) == UCS_INPROGRESS) {
+    //       ucp_request_cancel(worker_, req->req_);
+    //       debug_print("Server: Some send request cancelled.");
+    //     }
+    //   }
+    // }
 
-    {
-      // additional safe guard to clean ref counts
-      nb::gil_scoped_acquire acquire;
-      recv_reqs_.clear();
-      send_reqs_.clear();
-    }
+    // while (ucp_worker_progress(worker_) > 0) {
+    //   debug_print("Server: cancel in progress...");
+    // }
+
+    // {
+    //   // additional safe guard to clean ref counts
+    //   nb::gil_scoped_acquire acquire;
+    //   recv_reqs_.clear();
+    //   send_reqs_.clear();
+    // }
     // close all eps
     for (auto ep : connected_) {
       ucp_request_param_t param{};
       auto status = ucp_ep_close_nbx(ep, &param);
       if (UCS_PTR_STATUS(status) == UCS_OK) {
-        debug_print("Close some ep.");
+        debug_print("Server: Close some ep.");
         continue;
       } else if (UCS_PTR_IS_ERR(status)) {
         if (UCS_PTR_STATUS(status) == UCS_ERR_CONNECTION_RESET) {
-          debug_print("Some ep has been conn_reset.");
+          debug_print("Server: Some ep has been conn_reset.");
           continue;
         }
-        debug_print("Error when trying to close ep: {}",
+        debug_print("Server: Error when trying to close ep: {}",
                     ucs_status_string(UCS_PTR_STATUS(status)));
       } else {
         while (ucp_request_check_status(status) == UCS_INPROGRESS) {
           while (ucp_worker_progress(worker_) > 0) {
           }
         }
-        debug_print("Wait close some ep.");
+        debug_print("Server: Wait close some ep.");
         ucp_request_free(status);
       }
     }
@@ -840,6 +910,9 @@ struct Server {
       send_reqs_;
   Channel<ServerRecvPack> recv_q_;
   Channel<ServerSendPack> send_q_;
+  std::atomic<size_t> perf_msg_size_;
+  uintptr_t perf_client_;
+  double perf_result_;
 };
 
 int client_send_future_wrapper_tp_traverse(PyObject *self, visitproc visit,
@@ -1072,7 +1145,9 @@ NB_MODULE(_bindings, m) {
                    "dict(shape=(None,), device='cpu')], tag: int, tag_mask: "
                    "int, done_callback: Callable[[ClientRecvFuture], None], "
                    "fail_callback: Callable[[ClientRecvFuture], None]) -> "
-                   "ClientRecvFuture"));
+                   "ClientRecvFuture"))
+      .def("evaluate_perf", &Client::evaluate_perf, "msg_size"_a,
+           nb::call_guard<nb::gil_scoped_release>());
 
   nb::class_<ServerSendFuture>(m, "ServerSendFuture",
                                nb::type_slots(server_send_future_wrapper_slots))
@@ -1105,5 +1180,8 @@ NB_MODULE(_bindings, m) {
                    "Annotated[NDArray[numpy.uint8], dict(shape=(None,), "
                    "device='cpu')], tag: int, done_callback: "
                    "Callable[[ServerSendFuture], None], fail_callback: "
-                   "Callable[[ServerSendFuture], None]) -> ServerSendFuture"));
+                   "Callable[[ServerSendFuture], None]) -> ServerSendFuture"))
+      .def("evaluate_perf", &Server::evaluate_perf, "client_ep"_a, "msg_size"_a,
+           nb::call_guard<nb::gil_scoped_release>());
+  m.def("ucp_get_version", []() { return ucp_get_version_string(); });
 }
