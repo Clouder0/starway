@@ -53,7 +53,7 @@ def test_async(port):
         server_recv_buf = [np.empty(single_pack, np.uint8) for i in range(concurrency)]
         while not (clients := server.list_clients()):
             time.sleep(0.1)
-        client_ep = clients[0]
+        client_ep = next(iter(clients))
         server_send_futures = [
             server.asend(client_ep, server_send_buf[i], i + 10)
             for i in range(concurrency)
@@ -105,26 +105,30 @@ def test_async(port):
 
 
 def test_client_unconnected(port):
-    Client("127.0.0.1", port)
+    with pytest.raises(Exception):
+        Client("127.0.0.1", port)
 
 
 def test_client_unconnected_send(port):
-    client = Client("127.0.0.1", port)
-    arr = np.arange(10, dtype=np.uint8)
-    client.send(arr, 0)
+    with pytest.raises(Exception):
+        client = Client("127.0.0.1", port)
+        arr = np.arange(10, dtype=np.uint8)
+        client.send(arr, 0)
 
 
 def test_client_unconnected_recv(port):
-    client = Client("127.0.0.1", port)
-    arr = np.arange(10, dtype=np.uint8)
-    client.recv(arr, 0, 0xFF)
+    with pytest.raises(Exception):
+        client = Client("127.0.0.1", port)
+        arr = np.arange(10, dtype=np.uint8)
+        client.recv(arr, 0, 0xFF)
 
 
 def test_client_unconnected_send_recv(port):
-    client = Client("127.0.0.1", port)
-    arr = np.arange(10, dtype=np.uint8)
-    client.recv(arr, 0, 0xFF)
-    client.send(arr, 1)
+    with pytest.raises(Exception):
+        client = Client("127.0.0.1", port)
+        arr = np.arange(10, dtype=np.uint8)
+        client.recv(arr, 0, 0xFF)
+        client.send(arr, 1)
 
 
 def test_server_unconnected(port):
@@ -146,7 +150,7 @@ def test_pingpong_server_exit_first(port):
     recv_buf_s = np.arange(10, dtype=np.uint8)
     while len(server.list_clients()) < 1:
         time.sleep(0.01)
-    server.send(server.list_clients()[0], send_buf_s, 0)
+    server.send(next(iter(server.list_clients())), send_buf_s, 0)
     server.recv(recv_buf_s, 0, 0)
     client.send(send_buf_c, 0)
     client.recv(recv_buf_c, 0, 0)
@@ -163,7 +167,7 @@ def test_pingpong_client_exit_first(port):
     recv_buf_s = np.arange(10, dtype=np.uint8)
     while len(server.list_clients()) < 1:
         time.sleep(0.01)
-    server.send(server.list_clients()[0], send_buf_s, 0)
+    server.send(next(iter(server.list_clients())), send_buf_s, 0)
     server.recv(recv_buf_s, 0, 0)
     client.send(send_buf_c, 0)
     client.recv(recv_buf_c, 0, 0)
@@ -243,7 +247,7 @@ def test_server_send_no_recv_client_exit_first(port):
     send_buf_c = np.arange(10, dtype=np.uint8)
     while len(server.list_clients()) < 1:
         time.sleep(0.01)
-    server.send(server.list_clients()[0], send_buf_c, 0)
+    server.send(next(iter(server.list_clients())), send_buf_c, 0)
     del client
     del server
 
@@ -254,9 +258,10 @@ def test_server_send_no_recv_server_exit_first(port):
     send_buf_c = np.arange(10, dtype=np.uint8)
     while len(server.list_clients()) < 1:
         time.sleep(0.01)
-    server.send(server.list_clients()[0], send_buf_c, 0)
+    server.send(next(iter(server.list_clients())), send_buf_c, 0)
     del server
     del client
+
 
 def test_ucp_get_version():
     ucp_get_version()

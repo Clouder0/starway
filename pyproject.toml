@@ -34,7 +34,7 @@ build-dir = "build/{wheel_tag}"
 editable.mode = "redirect"
 editable.verbose = true
 editable.rebuild = false
-cmake.build-type = "Release"
+cmake.build-type = "Debug"
 
 [dependency-groups]
 dev = [
