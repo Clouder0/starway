@@ -6,52 +6,89 @@ import numpy as np
 
 from starway import Client, Server
 
-
 port = random.randint(10000, 50000)
-server = Server()
-server.listen("127.0.0.1", port)
-print("done")
-
-# future = client.aconnect("127.0.0.1", port, loop)
-# time.sleep(0.2)
-# async def main():
-#     loop = asyncio.get_running_loop()
-#     port = random.randint(10000, 50000)
-#     server = Server()
-#     client_connected = asyncio.Event()
-#     server.set_accept_cb(lambda x: client_connected.set())
-#     server.listen("127.0.0.1", port)
-#     await asyncio.sleep(0.01)
-#     client = Client()
-#     f_conn = client.aconnect("127.0.0.1", port)
-#     await f_conn
-#     await client_connected.wait()
-#     some_client = None
-#     for x in server.list_clients():
-#         some_client = x
-#         print(x.name)
-#         for device_name, port_name in x.view_transports():
-#             print("device", device_name, "port", port_name)
-#     assert some_client is not None
-
-#     send_buf_c = np.arange(10, dtype=np.uint8) + 1
-#     send_buf_s = np.arange(10, dtype=np.uint8) + 2
-#     recv_buf_c = np.arange(10, dtype=np.uint8) + 3
-#     recv_buf_s = np.arange(10, dtype=np.uint8) + 4
-#     f_send_s = server.asend(some_client, send_buf_s, 1, loop=loop)
-#     # f_recv_s = server.arecv(recv_buf_s, 2, 0xFF, loop=loop)
-#     # f_send_c = client.asend(send_buf_c, 2, loop=loop)
-#     f_recv_c = client.arecv(recv_buf_c, 1, 0xFF, loop=loop)
-#     time.sleep(0.1)
-#     # await asyncio.gather(f_send_s, f_recv_s, f_send_c, f_recv_c)
-#     # check results
-#     # assert np.all(send_buf_c == recv_buf_s)
-#     assert np.all(send_buf_s == recv_buf_c)
-#     time.sleep(1)
-#     await f_send_s
-#     await f_recv_c
-#     await client.aclose()
-#     await server.aclose()
 
 
-# asyncio.run(main())
+def test_async(port):
+    async def tester():
+        server = Server()
+        server.listen("127.0.0.1", port)
+        await asyncio.sleep(0.01)
+        client = Client()
+        await client.aconnect("127.0.0.1", port)
+        # concurrent sends
+        concurrency = 100
+        single_pack = 1024 * 1024 * 10
+        to_sends = [
+            np.arange(single_pack, dtype=np.uint8) * i for i in range(concurrency)
+        ]
+        print("Allocated.")
+
+        t0 = time.time()
+        send_futures = [client.asend(to_sends[i], i) for i in range(concurrency)]
+        to_recvs = [np.empty(single_pack, np.uint8) for i in range(concurrency)]
+        recv_futures = [
+            server.arecv(to_recvs[i], i, 0xFFFF) for i in range(concurrency)
+        ]
+        # full duplex test
+        server_send_buf = [
+            np.arange(single_pack, dtype=np.uint8) * (i + 10)
+            for i in range(concurrency)
+        ]
+        server_recv_buf = [np.empty(single_pack, np.uint8) for i in range(concurrency)]
+        while not (clients := server.list_clients()):
+            time.sleep(0.1)
+        client_ep = next(iter(clients))
+        server_send_futures = [
+            server.asend(client_ep, server_send_buf[i], i + 10)
+            for i in range(concurrency)
+        ]
+        client_recv_futures = [
+            client.arecv(server_recv_buf[i], i + 10, 0xFFFF) for i in range(concurrency)
+        ]
+
+        await asyncio.gather(
+            *send_futures, *recv_futures, *server_send_futures, *client_recv_futures
+        )
+        t1 = time.time()
+        print(
+            "Cost",
+            t1 - t0,
+            "seconds",
+            "Throughput: ",
+            single_pack * concurrency / (t1 - t0) / 1024 / 1024 / 1024 * 8 * 2,
+            "Gbps",
+        )
+        for x in send_futures:
+            assert x.done()
+            assert x.exception() is None
+
+        for i, x in enumerate(recv_futures):
+            assert x.done()
+            assert x.exception() is None
+            tag, length = x.result()
+            assert tag == i
+            assert length == single_pack
+        for i in range(concurrency):
+            assert np.allclose(to_sends[i], to_recvs[i])
+
+        for x in server_send_futures:
+            assert x.done()
+            assert x.exception() is None
+
+        for i, x in enumerate(client_recv_futures):
+            assert x.done()
+            assert x.exception() is None
+            tag, length = x.result()
+            assert tag == i + 10
+            assert length == single_pack
+
+        for i in range(concurrency):
+            assert np.allclose(server_send_buf[i], server_recv_buf[i])
+        await client.aclose()
+        await server.aclose()
+
+    asyncio.run(tester())
+
+
+test_async(port)

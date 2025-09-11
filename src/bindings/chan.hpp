@@ -45,7 +45,7 @@ public:
   // consumer should take charge of calling dtor,
   // as sometimes it would require GIL in reader func
   auto try_consume(auto &&reader) {
-    auto cur = status.load(std::memory_order_seq_cst);
+    auto cur = status.load(std::memory_order_acquire);
     if (cur < 0) {
       return false;
     }
@@ -69,7 +69,7 @@ public:
       if (status.compare_exchange_weak(expected, -2,
                                        std::memory_order_acq_rel)) {
         writer(reinterpret_cast<T *>(data_.data()));
-        status.store(index_of<T>(), std::memory_order_seq_cst);
+        status.store(index_of<T>(), std::memory_order_release);
         return;
       }
       while (status.load(std::memory_order_acquire) != -1) {
@@ -79,4 +79,42 @@ public:
   }
   std::atomic<int64_t> status{-1}; // -1: spare, -2: loading, >= 0: type index
   std::array<std::byte, max_size> data_;
+};
+
+template <class T> struct Channel {
+  bool wait_emplace(auto &&writer)
+    requires requires(decltype(writer) &&w, T *ptr) { w(ptr); }
+  {
+    uint8_t expected{0};
+    for (;;) {
+      if (status.compare_exchange_weak(expected, 1,
+                                       std::memory_order_acq_rel)) {
+        writer(&data_);
+        status.store(2, std::memory_order_release);
+        return true;
+      }
+      while (status.load(std::memory_order_acquire) != 0 &&
+             status.load(std::memory_order_acquire) != 3) {
+        std::this_thread::yield();
+      }
+      if (status.load(std::memory_order_acquire) == 3) {
+        // pipe closed
+        return false;
+      }
+    }
+  }
+  bool try_consume(auto &&reader)
+    requires requires(decltype(reader) &&r, T *ptr) { r(ptr); }
+  {
+    if (status.load(std::memory_order_acquire) != 2) {
+      return false;
+    }
+    reader(&data_);
+    status.store(0, std::memory_order_release);
+    return true;
+  }
+  void close() { status.store(3, std::memory_order_release); }
+
+  std::atomic<uint8_t> status{0}; // 0: spare, 1: loading, 2: ready 3: closed
+  T data_{};
 };

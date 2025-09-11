@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 import ctypes
 import ctypes.util
 import os
 import warnings
+from collections.abc import Callable
 from typing import Annotated, Literal
 
 import numpy as np
@@ -52,22 +52,10 @@ else:
 
 
 from ._bindings import Client as _Client  # type: ignore # noqa: E402
-from ._bindings import (  # type: ignore # noqa: E402
-    ClientRecvFuture as _ClientRecvFuture,
-)
-from ._bindings import (  # noqa: E402 # type: ignore
-    ClientSendFuture as _ClientSendFuture,
-)
 from ._bindings import Context  # type: ignore  # noqa: E402
 from ._bindings import Server as _Server  # type: ignore # noqa: E402
 from ._bindings import (  # type: ignore # noqa: E402
     ServerEndpoint as _ServerEndpoint,
-)
-from ._bindings import (  # type: ignore # noqa: E402
-    ServerRecvFuture as _ServerRecvFuture,
-)
-from ._bindings import (  # type: ignore # noqa: E402
-    ServerSendFuture as _ServerSendFuture,
 )
 
 
@@ -104,6 +92,16 @@ class Server:
     def list_clients(self):
         return self._server.list_clients()
 
+    def send(
+        self,
+        client_ep: _ServerEndpoint,
+        buffer: NDArray[np.uint8],
+        tag: int,
+        done_callback: Callable[[], None],
+        fail_callback: Callable[[str], None],
+    ):
+        return self._server.send(client_ep, buffer, tag, done_callback, fail_callback)
+
     def asend(
         self,
         client_ep: _ServerEndpoint,
@@ -115,17 +113,24 @@ class Server:
             loop = asyncio.get_running_loop()
         ret = asyncio.Future(loop=loop)
 
-        def cur_send(future: _ServerSendFuture):
+        def cur_send():
             ret.get_loop().call_soon_threadsafe(ret.set_result, None)
 
-        def cur_fail(future: _ServerSendFuture):
-            ret.get_loop().call_soon_threadsafe(
-                ret.set_exception, Exception(future.exception())
-            )
+        def cur_fail(reason: str):
+            ret.get_loop().call_soon_threadsafe(ret.set_exception, Exception(reason))
 
-        inner = self._server.send(client_ep, buffer, tag, cur_send, cur_fail)
-        ret._some = inner
+        self._server.send(client_ep, buffer, tag, cur_send, cur_fail)
         return ret
+
+    def recv(
+        self,
+        buffer: NDArray[np.uint8],
+        tag: int,
+        tag_mask: int,
+        done_callback: Callable[[int, int], None],
+        fail_callback: Callable[[str], None],
+    ):
+        return self._server.recv(buffer, tag, tag_mask, done_callback, fail_callback)
 
     def arecv(
         self,
@@ -138,15 +143,13 @@ class Server:
             loop = asyncio.get_running_loop()
         ret = asyncio.Future(loop=loop)
 
-        def cur_send(future: _ServerRecvFuture):
-            ret.get_loop().call_soon_threadsafe(ret.set_result, future.result())
+        def cur_send(sender_tag: int, length: int):
+            ret.get_loop().call_soon_threadsafe(ret.set_result, (sender_tag, length))
 
-        def cur_fail(future: _ServerRecvFuture):
-            ret.get_loop().call_soon_threadsafe(
-                ret.set_exception, Exception(future.exception())
-            )
+        def cur_fail(reason: str):
+            ret.get_loop().call_soon_threadsafe(ret.set_exception, Exception(reason))
 
-        ret._some = self._server.recv(buffer, tag, tag_mask, cur_send, cur_fail)
+        self._server.recv(buffer, tag, tag_mask, cur_send, cur_fail)
         return ret
 
     # def evaluate_perf(self, client_ep: _ServerEndpoint, msg_size: int) -> float:
@@ -186,6 +189,16 @@ class Client:
         self._client.close(close_cb)
         return ret
 
+    def recv(
+        self,
+        buffer: Annotated[NDArray[np.uint8], dict(shape=(None,), device="cpu")],
+        tag: int,
+        tag_mask: int,
+        done_callback: Callable[[int, int], None],
+        fail_callback: Callable[[str], None],
+    ):
+        return self._client.recv(buffer, tag, tag_mask, done_callback, fail_callback)
+
     def arecv(
         self,
         buffer: Annotated[NDArray[np.uint8], dict(shape=(None,), device="cpu")],
@@ -197,16 +210,23 @@ class Client:
             loop = asyncio.get_running_loop()
         ret = asyncio.Future(loop=loop)
 
-        def cur_send(future: _ClientRecvFuture):
-            ret.get_loop().call_soon_threadsafe(ret.set_result, future.result())
+        def cur_send(sender_tag: int, length: int):
+            ret.get_loop().call_soon_threadsafe(ret.set_result, (sender_tag, length))
 
-        def cur_fail(future: _ClientRecvFuture):
-            ret.get_loop().call_soon_threadsafe(
-                ret.set_exception, Exception(future.exception())
-            )
+        def cur_fail(reason: str):
+            ret.get_loop().call_soon_threadsafe(ret.set_exception, Exception(reason))
 
-        ret._some = self._client.recv(buffer, tag, tag_mask, cur_send, cur_fail)
+        self._client.recv(buffer, tag, tag_mask, cur_send, cur_fail)
         return ret
+
+    def send(
+        self,
+        buffer: Annotated[NDArray[np.uint8], dict(shape=(None,), device="cpu")],
+        tag: int,
+        done_callback: Callable[[], None],
+        fail_callback: Callable[[str], None],
+    ):
+        return self._client.send(buffer, tag, done_callback, fail_callback)
 
     def asend(
         self,
@@ -218,15 +238,13 @@ class Client:
             loop = asyncio.get_running_loop()
         ret = asyncio.Future(loop=loop)
 
-        def cur_send(future: _ClientSendFuture):
+        def cur_send():
             ret.get_loop().call_soon_threadsafe(ret.set_result, None)
 
-        def cur_fail(future: _ClientSendFuture):
-            ret.get_loop().call_soon_threadsafe(
-                ret.set_exception, Exception(future.exception())
-            )
+        def cur_fail(reason: str):
+            ret.get_loop().call_soon_threadsafe(ret.set_exception, Exception(reason))
 
-        ret._some = self._client.send(buffer, tag, cur_send, cur_fail)
+        self._client.send(buffer, tag, cur_send, cur_fail)
         return ret
 
     # def evaluate_perf(self, msg_size: int) -> float:

@@ -48,7 +48,7 @@ struct Context {
 };
 
 struct ClientSendArgs {
-  nb::object send_future;
+  ClientSendFuture *send_future;
   uint64_t tag;
   std::byte *buf_ptr;
   size_t buf_size;
@@ -63,27 +63,23 @@ struct ClientSendFuture {
   ClientSendFuture(ClientSendFuture &&) = delete;
   auto operator=(ClientSendFuture &&) -> ClientSendFuture & = delete;
 
-  void set_result(ucs_status_t result);
-  [[nodiscard]] bool done() const;
-  [[nodiscard]] const char *excpetion() const;
+  void set_result();
+  void set_exception(ucs_status_t result);
   // no result for send future
 
   Client *client_; // Client should outlives ClientSendFuture
   void *req_;
-  nb::object done_callback_;       // Callable[[ClientSendFuture], None]
-  nb::object fail_callback_;       // Callable[[ClientSendFuture], None]
-  std::atomic<uint8_t> status_{0}; // 0: sending  1: send done
-  ucs_status_t done_status_{UCS_OK};
+  nb::object done_callback_; // Callable[[ClientSendFuture], None]
+  nb::object fail_callback_; // Callable[[ClientSendFuture], None]
 };
 struct ClientRecvArgs {
-  nb::object recv_future;
+  ClientRecvFuture *recv_future;
   uint64_t tag;
   uint64_t tag_mask;
   std::byte *buf_ptr;
   size_t buf_size;
 };
 struct ClientRecvFuture {
-  using ResultType = std::tuple<uint64_t, size_t>;
   ClientRecvFuture(Client *client, auto &&done_callback, auto &&fail_callback)
     requires UniRef<decltype(done_callback), nb::object> &&
              UniRef<decltype(fail_callback), nb::object>;
@@ -92,20 +88,13 @@ struct ClientRecvFuture {
   ClientRecvFuture(ClientRecvFuture &&) = delete;
   auto operator=(ClientRecvFuture &&) -> ClientRecvFuture & = delete;
 
-  void set_result_value(ResultType result);
-  void set_result(ucs_status_t result);
-  [[nodiscard]] bool done() const;
-  [[nodiscard]] const char *excpetion() const;
-  [[nodiscard]] ResultType result() const;
-
+  void set_result(uint64_t sender_tag, size_t length);
+  void set_exception(ucs_status_t result);
   // no result for send future
   Client *client_; // Client should outlives ClientSendFuture
   void *req_;
-  nb::object done_callback_;       // Callable[[ClientSendFuture], None]
-  nb::object fail_callback_;       // Callable[[ClientSendFuture], None]
-  std::atomic<uint8_t> status_{0}; // 0: sending  1: send done
-  ucs_status_t done_status_{UCS_OK};
-  ResultType result_;
+  nb::object done_callback_; // Callable[[ClientSendFuture], None]
+  nb::object fail_callback_; // Callable[[ClientSendFuture], None]
 };
 
 struct ClientConnectArgs {
@@ -114,6 +103,8 @@ struct ClientConnectArgs {
 struct ClientCloseArgs {
   nb::object close_callback;
 };
+
+struct ClientDestructorCloseArgs {};
 
 struct Client {
   Client(Context &ctx);
@@ -129,37 +120,31 @@ struct Client {
   void close(nb::object close_callback);
   // Callable[[], None]
 
-  nb::object
-  send(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> const &buffer,
-       uint64_t tag, nb::object done_callback, nb::object fail_callback);
+  void send(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> const &buffer,
+            uint64_t tag, nb::object done_callback, nb::object fail_callback);
   // Callable[[ClientSendFuture], None]
 
-  nb::object recv(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> &buffer,
-                  uint64_t tag, uint64_t tag_mask, nb::object done_callback,
-                  nb::object fail_callback);
+  void recv(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> &buffer,
+            uint64_t tag, uint64_t tag_mask, nb::object done_callback,
+            nb::object fail_callback);
   // Callable[[ClientRecvFuture], None]
 
   //   double evaluate_perf(size_t msg_size);
   void start_working(std::string addr, uint64_t port);
+  void cancel_pending_reqs();
 
   ucp_context_h ctx_;
   std::thread working_thread_;
   std::atomic<uint8_t> status_{
       0}; // 0: void 1: initialized 2: running 3: closed
-  MultiChannel<ClientSendArgs, ClientRecvArgs, ClientConnectArgs,
-               ClientCloseArgs>
-      chan_;
-  std::set<nb::object> send_futures_;
-  std::set<nb::object> recv_futures_;
+  Channel<ClientSendArgs> send_args_;
+  Channel<ClientRecvArgs> recv_args_;
+  nb::object connect_callback_;
+  nb::object close_callback_;
+  std::set<ClientSendFuture *> send_futures_;
+  std::set<ClientRecvFuture *> recv_futures_;
 };
 
-struct ServerSendArgs {
-  nb::object send_future;
-  ucp_ep_h ep;
-  uint64_t tag;
-  std::byte *buf_ptr;
-  size_t buf_size;
-};
 struct ServerSendFuture {
   ServerSendFuture(Server *server, auto &&done_callback, auto &&fail_callback)
     requires UniRef<decltype(done_callback), nb::object> &&
@@ -167,55 +152,55 @@ struct ServerSendFuture {
   ;
   ServerSendFuture(ServerSendFuture const &) = delete;
   auto operator=(ServerSendFuture const &) -> ServerSendFuture & = delete;
-  ServerSendFuture(ServerSendFuture &&) = delete;
-  auto operator=(ServerSendFuture &&) -> ServerSendFuture & = delete;
+  ServerSendFuture(ServerSendFuture &&) = default;
+  auto operator=(ServerSendFuture &&) -> ServerSendFuture & = default;
 
-  void set_result(ucs_status_t result);
-  [[nodiscard]] bool done() const;
-  [[nodiscard]] const char *excpetion() const;
+  void set_result();
+  void set_exception(ucs_status_t result);
 
   Server *server_; // Server should outlives ServerSendFuture
   void *req_;
-  nb::object done_callback_;       // Callable[[ServerSendFuture], None]
-  nb::object fail_callback_;       // Callable[[ServerSendFuture], None]
-  std::atomic<uint8_t> status_{0}; // 0: sending  1: send done
-  ucs_status_t done_status_{UCS_OK};
+  nb::object done_callback_; // Callable[[ServerSendFuture], None]
+  nb::object fail_callback_; // Callable[[ServerSendFuture], None]
 };
-struct ServerRecvArgs {
-  nb::object recv_future;
+struct ServerSendArgs {
+  ServerSendFuture *send_future;
+  ucp_ep_h ep;
   uint64_t tag;
-  uint64_t tag_mask;
   std::byte *buf_ptr;
   size_t buf_size;
 };
+
 struct ServerRecvFuture {
-  using ResultType = std::tuple<uint64_t, size_t>;
   ServerRecvFuture(Server *server, auto &&done_callback, auto &&fail_callback)
     requires UniRef<decltype(done_callback), nb::object> &&
              UniRef<decltype(fail_callback), nb::object>;
   ServerRecvFuture(ServerRecvFuture const &) = delete;
   auto operator=(ServerRecvFuture const &) -> ServerRecvFuture & = delete;
-  ServerRecvFuture(ServerRecvFuture &&) = delete;
-  auto operator=(ServerRecvFuture &&) -> ServerRecvFuture & = delete;
+  ServerRecvFuture(ServerRecvFuture &&) = default;
+  auto operator=(ServerRecvFuture &&) -> ServerRecvFuture & = default;
 
-  void set_result_value(ResultType result);
-  void set_result(ucs_status_t result);
-  [[nodiscard]] bool done() const;
-  [[nodiscard]] const char *excpetion() const;
-  [[nodiscard]] ResultType result() const;
+  void set_result(uint64_t sender_tag, size_t length);
+  void set_exception(ucs_status_t result);
 
   Server *server_; // Server should outlives ServerRecvFuture
   void *req_;
-  nb::object done_callback_;       // Callable[[ServerRecvFuture], None]
-  nb::object fail_callback_;       // Callable[[ServerRecvFuture], None]
-  std::atomic<uint8_t> status_{0}; // 0: sending  1: send done
-  ucs_status_t done_status_{UCS_OK};
-  ResultType result_;
+  nb::object done_callback_; // Callable[[ServerRecvFuture], None]
+  nb::object fail_callback_; // Callable[[ServerRecvFuture], None]
+};
+struct ServerRecvArgs {
+  ServerRecvFuture *recv_future;
+  uint64_t tag;
+  uint64_t tag_mask;
+  std::byte *buf_ptr;
+  size_t buf_size;
 };
 
 struct ServerCloseArgs {
   nb::object close_callback;
 };
+
+struct ServerDestructorCloseArgs {};
 
 struct ServerEndpoint {
   ucp_ep_h ep;
@@ -244,29 +229,31 @@ struct Server {
   void listen(std::string addr, uint16_t port);
   void close(nb::object close_callback);
 
-  nb::object
-  send(ServerEndpoint const &client_ep,
-       nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> const &buffer,
-       uint64_t tag, nb::object done_callback, nb::object fail_callback);
+  void send(ServerEndpoint const &client_ep,
+            nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> const &buffer,
+            uint64_t tag, nb::object done_callback, nb::object fail_callback);
   // Callable[[ServerSendFuture], None]
 
-  nb::object recv(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> &buffer,
-                  uint64_t tag, uint64_t tag_mask, nb::object done_callback,
-                  nb::object fail_callback);
+  void recv(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> &buffer,
+            uint64_t tag, uint64_t tag_mask, nb::object done_callback,
+            nb::object fail_callback);
   // Callable[[ServerRecvFuture], None]
 
   auto list_clients() const -> std::set<ServerEndpoint> const &;
   //   double evaluate_perf(ServerEndpoint const &client_ep, size_t msg_size);
 
   void start_working(std::string addr, uint16_t port);
+  void cancel_pending_reqs();
 
   ucp_context_h ctx_;
   std::thread working_thread_;
   std::atomic<uint8_t> status_{
-      0}; // 0: void 1: initialized 2: running 3: closed
-  MultiChannel<ServerSendArgs, ServerRecvArgs, ServerCloseArgs> chan_;
+      0}; // 0: void 1: initialized 2: running 3: to close  4: closed
+  Channel<ServerSendArgs> send_args_;
+  Channel<ServerRecvArgs> recv_args_;
+  nb::object close_callback_;
   nb::object accept_callback_;
   std::set<ServerEndpoint> eps_;
-  std::set<nb::object> send_futures_;
-  std::set<nb::object> recv_futures_;
+  std::set<ServerSendFuture *> send_futures_;
+  std::set<ServerRecvFuture *> recv_futures_;
 };
