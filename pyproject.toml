@@ -1,6 +1,6 @@
 [project]
 name = "starway"
-version = "0.3.0"
+version = "0.4.0"
 description = "Starway UCX P2P communication lib."
 readme = "README.md"
 authors = [
