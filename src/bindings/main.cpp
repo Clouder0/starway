@@ -4,6 +4,7 @@
 #include "ucp/api/ucp_def.h"
 #include "ucs/type/status.h"
 #include <arpa/inet.h>
+#include <atomic>
 #include <cassert>
 #include <compare>
 #include <format>
@@ -311,6 +312,22 @@ void Client::start_working(std::string addr, uint64_t port) {
       // args.recv_future = nullptr;
       return;
     });
+    if (perf_status_.load(std::memory_order_acquire) == 1) {
+      ucp_ep_evaluate_perf_attr_t perf_attr{
+          .field_mask = UCP_EP_PERF_ATTR_FIELD_ESTIMATED_TIME,
+      };
+      ucp_ep_evaluate_perf_param_t params{
+          .field_mask = UCP_EP_PERF_PARAM_FIELD_MESSAGE_SIZE,
+          .message_size = perf_args_.msg_size,
+      };
+      auto status = ucp_ep_evaluate_perf(ep, &params, &perf_attr);
+      if (status != UCS_OK) [[unlikely]] {
+        fatal_print("Server: evaluate perf failed with {}",
+                    ucs_status_string(status));
+      }
+      perf_result_ = perf_attr.estimated_time;
+      perf_status_.store(0, std::memory_order_release);
+    }
   }
   // final cleanup process
   debug_print("Client: start close...");
@@ -326,16 +343,23 @@ void Client::start_working(std::string addr, uint64_t port) {
 
   // cleanup requests, cancel them all
   debug_print("Client: start cancel requests.");
-  for (auto *p : send_futures_) {
-    assert(ucp_request_check_status(p->req_) == UCS_INPROGRESS);
-    // this should trigger callback and delete the pointer
-    ucp_request_cancel(worker, p->req_);
-    assert(ucp_request_check_status(p->req_) == UCS_ERR_CANCELED);
-  }
-  for (auto *p : recv_futures_) {
-    assert(ucp_request_check_status(p->req_) == UCS_INPROGRESS);
-    ucp_request_cancel(worker, p->req_);
-    assert(ucp_request_check_status(p->req_) == UCS_ERR_CANCELED);
+  {
+    // hold a temporary cache to avoid invalidation after delete
+    std::vector<ClientSendFuture *> cur_send_futures{send_futures_.begin(),
+                                                     send_futures_.end()};
+    std::vector<ClientRecvFuture *> cur_recv_futures{recv_futures_.begin(),
+                                                     recv_futures_.end()};
+    for (auto *p : cur_send_futures) {
+      assert(ucp_request_check_status(p->req_) == UCS_INPROGRESS);
+      // this should trigger callback and delete the pointer
+      ucp_request_cancel(worker, p->req_);
+      // now that p has been freed
+    }
+    for (auto *p : cur_recv_futures) {
+      assert(ucp_request_check_status(p->req_) == UCS_INPROGRESS);
+      ucp_request_cancel(worker, p->req_);
+      // now that p has been freed
+    }
   }
   debug_print("Client: done cancel requests.");
 
@@ -402,7 +426,7 @@ void Client::send(
     nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> const &buffer,
     uint64_t tag, nb::object done_callback, nb::object fail_callback) {
   if (status_.load(std::memory_order_acquire) != 2) {
-    std::runtime_error(
+    throw std::runtime_error(
         "Client: not running. You can only  send , after connect.");
   }
   auto buf_ptr = reinterpret_cast<std::byte *>(buffer.data());
@@ -424,7 +448,7 @@ void Client::recv(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> &buffer,
                   uint64_t tag, uint64_t tag_mask, nb::object done_callback,
                   nb::object fail_callback) {
   if (status_.load(std::memory_order_acquire) != 2) {
-    std::runtime_error(
+    throw std::runtime_error(
         "Client: not running. You can only  recv , after connect.");
   }
   auto buf_ptr = reinterpret_cast<std::byte *>(buffer.data());
@@ -442,6 +466,19 @@ void Client::recv(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> &buffer,
       delete p_future;
     }
   }
+}
+double Client::evaluate_perf(size_t msg_size) {
+  if (status_.load(std::memory_order_acquire) != 2) [[unlikely]] {
+    throw std::runtime_error(
+        "Server: not running. You can only evaluate perf, after listen.");
+  }
+  nb::gil_scoped_release release;
+  perf_args_ = ClientPerfArgs(msg_size);
+  perf_status_.store(1, std::memory_order_release);
+  while (perf_status_.load(std::memory_order_acquire) == 1) {
+    std::this_thread::yield();
+  }
+  return perf_result_;
 }
 
 void Client::cancel_pending_reqs() {
@@ -672,6 +709,7 @@ void Server::start_working(std::string addr, uint16_t port) {
       if (UCS_PTR_STATUS(req) == UCS_OK) {
         nb::gil_scoped_acquire acquire;
         debug_print("Server: send success immediately");
+        args.send_future->set_result();
         delete args.send_future;
         return;
       }
@@ -725,6 +763,22 @@ void Server::start_working(std::string addr, uint16_t port) {
       // args.recv_future = nullptr;
       return;
     });
+    if (perf_status_.load(std::memory_order_acquire) == 1) {
+      ucp_ep_evaluate_perf_attr_t perf_attr{
+          .field_mask = UCP_EP_PERF_ATTR_FIELD_ESTIMATED_TIME,
+      };
+      ucp_ep_evaluate_perf_param_t params{
+          .field_mask = UCP_EP_PERF_PARAM_FIELD_MESSAGE_SIZE,
+          .message_size = perf_args_.msg_size,
+      };
+      auto status = ucp_ep_evaluate_perf(perf_args_.ep, &params, &perf_attr);
+      if (status != UCS_OK) [[unlikely]] {
+        fatal_print("Server: evaluate perf failed with {}",
+                    ucs_status_string(status));
+      }
+      perf_result_ = perf_attr.estimated_time;
+      perf_status_.store(0, std::memory_order_release);
+    }
   }
   debug_print("Server: start close...");
   while (ucp_worker_progress(worker) > 0) {
@@ -744,16 +798,21 @@ void Server::start_working(std::string addr, uint16_t port) {
 
   // cancel all existing requests
   debug_print("Server: start cancel requests.");
-  for (auto *p : send_futures_) {
-    assert(ucp_request_check_status(p->req_) == UCS_INPROGRESS);
-    // this should trigger callback and delete the pointer
-    ucp_request_cancel(worker, p->req_);
-    assert(ucp_request_check_status(p->req_) == UCS_ERR_CANCELED);
-  }
-  for (auto *p : recv_futures_) {
-    assert(ucp_request_check_status(p->req_) == UCS_INPROGRESS);
-    ucp_request_cancel(worker, p->req_);
-    assert(ucp_request_check_status(p->req_) == UCS_ERR_CANCELED);
+  {
+    // avoid invalidation after delete
+    std::vector<ServerSendFuture *> cur_send_futures{send_futures_.begin(),
+                                                     send_futures_.end()};
+    std::vector<ServerRecvFuture *> cur_recv_futures{recv_futures_.begin(),
+                                                     recv_futures_.end()};
+    for (auto *p : cur_send_futures) {
+      assert(ucp_request_check_status(p->req_) == UCS_INPROGRESS);
+      // this should trigger callback and delete the pointer
+      ucp_request_cancel(worker, p->req_);
+    }
+    for (auto *p : cur_recv_futures) {
+      assert(ucp_request_check_status(p->req_) == UCS_INPROGRESS);
+      ucp_request_cancel(worker, p->req_);
+    }
   }
   debug_print("Server: done cancel requests.");
 
@@ -813,7 +872,8 @@ void Server::send(
     nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> const &buffer,
     uint64_t tag, nb::object done_callback, nb::object fail_callback) {
   if (status_.load(std::memory_order_acquire) != 2) [[unlikely]] {
-    std::runtime_error("Server: not running. You can only send, after listen.");
+    throw std::runtime_error(
+        "Server: not running. You can only send, after listen.");
   }
   auto buf_ptr = reinterpret_cast<std::byte *>(buffer.data());
   auto buf_size = buffer.size();
@@ -836,7 +896,8 @@ void Server::recv(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> &buffer,
                   uint64_t tag, uint64_t tag_mask, nb::object done_callback,
                   nb::object fail_callback) {
   if (status_.load(std::memory_order_acquire) != 2) {
-    std::runtime_error("Server: not running. You can only recv, after listen.");
+    throw std::runtime_error(
+        "Server: not running. You can only recv, after listen.");
   }
   auto buf_ptr = reinterpret_cast<std::byte *>(buffer.data());
   auto buf_size = buffer.size();
@@ -873,6 +934,20 @@ void Server::cancel_pending_reqs() {
     args.recv_future->set_exception(UCS_ERR_CANCELED);
     delete args.recv_future;
   });
+}
+
+double Server::evaluate_perf(ServerEndpoint const &client_ep, size_t msg_size) {
+  if (status_.load(std::memory_order_acquire) != 2) [[unlikely]] {
+    throw std::runtime_error(
+        "Server: not running. You can only evaluate perf, after listen.");
+  }
+  nb::gil_scoped_release release;
+  perf_args_ = ServerPerfArgs(client_ep.ep, msg_size);
+  perf_status_.store(1, std::memory_order_release);
+  while (perf_status_.load(std::memory_order_acquire) == 1) {
+    std::this_thread::yield();
+  }
+  return perf_result_;
 }
 
 Server::~Server() {
@@ -915,7 +990,9 @@ NB_MODULE(_bindings, m) {
       .def("recv", &Server::recv, "buffer"_a, "tag"_a, "tag_mask"_a,
            "done_callback"_a, "fail_callback"_a)
       .def("list_clients", &Server::list_clients,
-           nb::rv_policy::reference_internal);
+           nb::rv_policy::reference_internal)
+      .def("evaluate_perf", &Server::evaluate_perf, "client_ep"_a,
+           "msg_size"_a);
 
   nb::class_<Client>(m, "Client")
       .def(nb::init<Context &>(), "ctx"_a)
@@ -924,5 +1001,6 @@ NB_MODULE(_bindings, m) {
       .def("send", &Client::send, "buffer"_a, "tag"_a, "done_callback"_a,
            "fail_callback"_a)
       .def("recv", &Client::recv, "buffer"_a, "tag"_a, "tag_mask"_a,
-           "done_callback"_a, "fail_callback"_a);
+           "done_callback"_a, "fail_callback"_a)
+      .def("evaluate_perf", &Client::evaluate_perf, "msg_size"_a);
 }

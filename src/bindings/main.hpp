@@ -97,14 +97,9 @@ struct ClientRecvFuture {
   nb::object fail_callback_; // Callable[[ClientSendFuture], None]
 };
 
-struct ClientConnectArgs {
-  nb::object connect_callback;
+struct ClientPerfArgs {
+  size_t msg_size;
 };
-struct ClientCloseArgs {
-  nb::object close_callback;
-};
-
-struct ClientDestructorCloseArgs {};
 
 struct Client {
   Client(Context &ctx);
@@ -129,7 +124,7 @@ struct Client {
             nb::object fail_callback);
   // Callable[[ClientRecvFuture], None]
 
-  //   double evaluate_perf(size_t msg_size);
+  double evaluate_perf(size_t msg_size);
   void start_working(std::string addr, uint64_t port);
   void cancel_pending_reqs();
 
@@ -139,6 +134,10 @@ struct Client {
       0}; // 0: void 1: initialized 2: running 3: closed
   Channel<ClientSendArgs> send_args_;
   Channel<ClientRecvArgs> recv_args_;
+  std::atomic<uint8_t> perf_status_{0}; // 0: nothing 1: written
+  ClientPerfArgs perf_args_;
+  double perf_result_;
+
   nb::object connect_callback_;
   nb::object close_callback_;
   std::set<ClientSendFuture *> send_futures_;
@@ -196,11 +195,11 @@ struct ServerRecvArgs {
   size_t buf_size;
 };
 
-struct ServerCloseArgs {
-  nb::object close_callback;
+struct ServerPerfArgs {
+  ucp_ep_h ep;
+  size_t msg_size;
 };
 
-struct ServerDestructorCloseArgs {};
 
 struct ServerEndpoint {
   ucp_ep_h ep;
@@ -240,7 +239,7 @@ struct Server {
   // Callable[[ServerRecvFuture], None]
 
   auto list_clients() const -> std::set<ServerEndpoint> const &;
-  //   double evaluate_perf(ServerEndpoint const &client_ep, size_t msg_size);
+  double evaluate_perf(ServerEndpoint const &client_ep, size_t msg_size);
 
   void start_working(std::string addr, uint16_t port);
   void cancel_pending_reqs();
@@ -251,6 +250,9 @@ struct Server {
       0}; // 0: void 1: initialized 2: running 3: to close  4: closed
   Channel<ServerSendArgs> send_args_;
   Channel<ServerRecvArgs> recv_args_;
+  std::atomic<uint8_t> perf_status_{0}; // 0: nothing 1: written
+  ServerPerfArgs perf_args_;
+  double perf_result_;
   nb::object close_callback_;
   nb::object accept_callback_;
   std::set<ServerEndpoint> eps_;

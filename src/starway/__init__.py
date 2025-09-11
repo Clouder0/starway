@@ -108,10 +108,10 @@ class Server:
         buffer: Annotated[NDArray[np.uint8], dict(shape=(None,), device="cpu")],
         tag: int,
         loop: asyncio.AbstractEventLoop | None = None,
-    ) -> asyncio.Future[None]:
+    ):
         if loop is None:
             loop = asyncio.get_running_loop()
-        ret = asyncio.Future(loop=loop)
+        ret: asyncio.Future[None] = asyncio.Future(loop=loop)
 
         def cur_send():
             ret.get_loop().call_soon_threadsafe(ret.set_result, None)
@@ -138,10 +138,10 @@ class Server:
         tag: int,
         tag_mask: int,
         loop: asyncio.AbstractEventLoop | None = None,
-    ) -> asyncio.Future[tuple[int, int]]:
+    ):
         if loop is None:
             loop = asyncio.get_running_loop()
-        ret = asyncio.Future(loop=loop)
+        ret: asyncio.Future[tuple[int, int]] = asyncio.Future(loop=loop)
 
         def cur_send(sender_tag: int, length: int):
             ret.get_loop().call_soon_threadsafe(ret.set_result, (sender_tag, length))
@@ -152,9 +152,8 @@ class Server:
         self._server.recv(buffer, tag, tag_mask, cur_send, cur_fail)
         return ret
 
-    # def evaluate_perf(self, client_ep: _ServerEndpoint, msg_size: int) -> float:
-    # return self._server.evaluate_perf(client_ep, msg_size)
-
+    def evaluate_perf(self, client_ep: _ServerEndpoint, msg_size: int) -> float:
+        return self._server.evaluate_perf(client_ep, msg_size)
 
 class Client:
     def __init__(self):
@@ -205,10 +204,10 @@ class Client:
         tag: int,
         tag_mask: int,
         loop: asyncio.AbstractEventLoop | None = None,
-    ) -> asyncio.Future[tuple[int, int]]:
+    ):
         if loop is None:
             loop = asyncio.get_running_loop()
-        ret = asyncio.Future(loop=loop)
+        ret: asyncio.Future[tuple[int, int]] = asyncio.Future(loop=loop)
 
         def cur_send(sender_tag: int, length: int):
             ret.get_loop().call_soon_threadsafe(ret.set_result, (sender_tag, length))
@@ -233,10 +232,10 @@ class Client:
         buffer: Annotated[NDArray[np.uint8], dict(shape=(None,), device="cpu")],
         tag: int,
         loop: asyncio.AbstractEventLoop | None = None,
-    ) -> asyncio.Future[None]:
+    ):
         if loop is None:
             loop = asyncio.get_running_loop()
-        ret = asyncio.Future(loop=loop)
+        ret: asyncio.Future[None] = asyncio.Future(loop=loop)
 
         def cur_send():
             ret.get_loop().call_soon_threadsafe(ret.set_result, None)
@@ -246,6 +245,9 @@ class Client:
 
         self._client.send(buffer, tag, cur_send, cur_fail)
         return ret
+    
+    def evaluate_perf(self, msg_size: int) -> float:
+        return self._client.evaluate_perf(msg_size)
 
     # def evaluate_perf(self, msg_size: int) -> float:
     # return self._client.evaluate_perf(msg_size)

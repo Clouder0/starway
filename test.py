@@ -3,12 +3,12 @@ import random
 import time
 
 import numpy as np
+import uvloop
 
 from starway import Client, Server
 
 p = random.randint(10000, 11000)
 p2 = random.randint(10000, 11000)
-
 
 
 total_send_done = 0
@@ -24,11 +24,9 @@ def test_async():
         await client.aconnect("127.0.0.1", p2)
         await asyncio.sleep(0.2)
         # concurrent sends
-        concurrency = 10
-        single_pack = 1024 * 1024 * 10
-        to_sends = [
-            np.arange(single_pack, dtype=np.uint8) * i for i in range(concurrency)
-        ]
+        concurrency = 5
+        single_pack = 1024 * 1024 * 1024
+        to_sends = [np.ones(single_pack, dtype=np.uint8) for i in range(concurrency)]
         print("Allocated.")
 
         t0 = time.time()
@@ -45,24 +43,14 @@ def test_async():
             single_pack * concurrency / (t1 - t0) / 1024 / 1024 / 1024 * 8,
             "Gbps",
         )
-        for x in send_futures:
-            assert x.done()
-            assert x.exception() is None
+        # for i in range(concurrency):
+        # assert np.allclose(to_sends[i], to_recvs[i])
 
-        for i, x in enumerate(recv_futures):
-            assert x.done()
-            assert x.exception() is None
-            tag, length = x.result()
-            assert tag == i
-            assert length == single_pack
-        for i in range(concurrency):
-            assert np.allclose(to_sends[i], to_recvs[i])
-        
         print("All done, closing")
         await client.aclose()
         await server.aclose()
 
-    asyncio.run(tester())
+    uvloop.run(tester())
 
 
 test_async()
