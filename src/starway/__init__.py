@@ -266,6 +266,27 @@ class Client:
         self._client.send(buffer, tag, cur_send, cur_fail)
         return ret
 
+    def flush(
+        self,
+        done_callback: Callable[[], None],
+        fail_callback: Callable[[str], None],
+    ):
+        return self._client.flush(done_callback, fail_callback)
+
+    def aflush(self, loop: asyncio.AbstractEventLoop | None = None):
+        if loop is None:
+            loop = asyncio.get_running_loop()
+        ret: asyncio.Future[None] = asyncio.Future(loop=loop)
+
+        def cur_done():
+            ret.get_loop().call_soon_threadsafe(ret.set_result, None)
+
+        def cur_fail(reason: str):
+            ret.get_loop().call_soon_threadsafe(ret.set_exception, Exception(reason))
+
+        self._client.flush(cur_done, cur_fail)
+        return ret
+
     def evaluate_perf(self, msg_size: int) -> float:
         return self._client.evaluate_perf(msg_size)
 

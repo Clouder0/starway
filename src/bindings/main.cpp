@@ -106,6 +106,26 @@ void ClientRecvFuture::set_exception(ucs_status_t result) {
   fail_callback_(nb::cast(ucs_status_string(result)));
 }
 
+ClientFlushFuture::ClientFlushFuture(Client *client, auto &&done_callback,
+                                     auto &&fail_callback)
+  requires UniRef<decltype(done_callback), nb::object> &&
+               UniRef<decltype(fail_callback), nb::object>
+    : client_(client), req_(nullptr),
+      done_callback_(std::forward<decltype(done_callback)>(done_callback)),
+      fail_callback_(std::forward<decltype(fail_callback)>(fail_callback)) {}
+
+void ClientFlushFuture::set_result() {
+  debug_print("Client Flush Future done.");
+  assert(done_callback_.is_valid());
+  done_callback_();
+}
+void ClientFlushFuture::set_exception(ucs_status_t result) {
+  fatal_print("Client Flush Future failed with {}.",
+              ucs_status_string(result));
+  assert(fail_callback_.is_valid());
+  fail_callback_(nb::cast(ucs_status_string(result)));
+}
+
 Client::Client(Context &ctx) : ctx_(ctx.context_) {}
 
 struct PinTrait {
@@ -157,6 +177,26 @@ void client_send_cb(void *req, ucs_status_t status, void *user_data) {
     delete send_future;
   }
   // free the request
+  ucp_request_free(req);
+}
+
+void client_flush_cb(void *req, ucs_status_t status, void *user_data) {
+  auto *flush_future = reinterpret_cast<ClientFlushFuture *>(user_data);
+  {
+    nb::gil_scoped_acquire acquire;
+    if (status == UCS_OK) {
+      debug_print("Client: waited flush future done.");
+      assert(flush_future->req_ == req);
+      flush_future->set_result();
+    } else {
+      fatal_print("Client: waited flush future done. Bad status. {}",
+                  ucs_status_string(status));
+      assert(flush_future->req_ == req);
+      flush_future->set_exception(status);
+    }
+    flush_future->client_->flush_futures_.erase(flush_future);
+    delete flush_future;
+  }
   ucp_request_free(req);
 }
 
@@ -312,6 +352,32 @@ void Client::start_working(std::string addr, uint64_t port) {
       // args.recv_future = nullptr;
       return;
     });
+    flush_args_.try_consume([&](auto *ptr) {
+      ClientFlushArgs &args = *ptr;
+      ucp_request_param_t param{.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                                               UCP_OP_ATTR_FIELD_USER_DATA,
+                                .cb{.send = client_flush_cb},
+                                .user_data = args.flush_future};
+      auto *req = ucp_worker_flush_nbx(worker, &param);
+      if (UCS_PTR_STATUS(req) == UCS_OK) {
+        debug_print("Client: flush success immediately");
+        nb::gil_scoped_acquire acquire;
+        args.flush_future->set_result();
+        delete args.flush_future;
+        return;
+      } else if (UCS_PTR_IS_ERR(req)) {
+        fatal_print("Client: flush failed with {}",
+                    ucs_status_string(UCS_PTR_STATUS(req)));
+        nb::gil_scoped_acquire acquire;
+        args.flush_future->set_exception(UCS_PTR_STATUS(req));
+        delete args.flush_future;
+        return;
+      }
+      debug_print("Client: async flush future created pending.");
+      args.flush_future->req_ = req;
+      flush_futures_.emplace(args.flush_future);
+      return;
+    });
     if (perf_status_.load(std::memory_order_acquire) == 1) {
       ucp_ep_evaluate_perf_attr_t perf_attr{
           .field_mask = UCP_EP_PERF_ATTR_FIELD_ESTIMATED_TIME,
@@ -338,6 +404,7 @@ void Client::start_working(std::string addr, uint64_t port) {
   debug_print("Client: close channels");
   send_args_.close();
   recv_args_.close();
+  flush_args_.close();
   // potential pending requests would be resovled as cancelled in dtor
   cancel_pending_reqs();
 
@@ -349,6 +416,8 @@ void Client::start_working(std::string addr, uint64_t port) {
                                                      send_futures_.end()};
     std::vector<ClientRecvFuture *> cur_recv_futures{recv_futures_.begin(),
                                                      recv_futures_.end()};
+    std::vector<ClientFlushFuture *> cur_flush_futures{flush_futures_.begin(),
+                                                       flush_futures_.end()};
     for (auto *p : cur_send_futures) {
       assert(ucp_request_check_status(p->req_) == UCS_INPROGRESS);
       // this should trigger callback and delete the pointer
@@ -359,6 +428,10 @@ void Client::start_working(std::string addr, uint64_t port) {
       assert(ucp_request_check_status(p->req_) == UCS_INPROGRESS);
       ucp_request_cancel(worker, p->req_);
       // now that p has been freed
+    }
+    for (auto *p : cur_flush_futures) {
+      assert(ucp_request_check_status(p->req_) == UCS_INPROGRESS);
+      ucp_request_cancel(worker, p->req_);
     }
   }
   debug_print("Client: done cancel requests.");
@@ -467,6 +540,24 @@ void Client::recv(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> &buffer,
     }
   }
 }
+
+void Client::flush(nb::object done_callback, nb::object fail_callback) {
+  if (status_.load(std::memory_order_acquire) != 2) [[unlikely]] {
+    throw std::runtime_error(
+        "Client: not running. You can only flush, after connect.");
+  }
+  auto p_future = new ClientFlushFuture(this, std::move(done_callback),
+                                        std::move(fail_callback));
+  {
+    nb::gil_scoped_release release;
+    auto success = flush_args_.wait_emplace(
+        [&](auto *ptr) { new (ptr) ClientFlushArgs{p_future}; });
+    if (!success) [[unlikely]] {
+      p_future->set_exception(UCS_ERR_NOT_CONNECTED);
+      delete p_future;
+    }
+  }
+}
 double Client::evaluate_perf(size_t msg_size) {
   if (status_.load(std::memory_order_acquire) != 2) [[unlikely]] {
     throw std::runtime_error(
@@ -495,6 +586,12 @@ void Client::cancel_pending_reqs() {
     nb::gil_scoped_acquire acquire;
     args.recv_future->set_exception(UCS_ERR_CANCELED);
     delete args.recv_future;
+  });
+  flush_args_.try_consume([&](auto *ptr) {
+    ClientFlushArgs &args = *ptr;
+    nb::gil_scoped_acquire acquire;
+    args.flush_future->set_exception(UCS_ERR_CANCELED);
+    delete args.flush_future;
   });
 }
 
@@ -1099,5 +1196,6 @@ NB_MODULE(_bindings, m) {
            "fail_callback"_a)
       .def("recv", &Client::recv, "buffer"_a, "tag"_a, "tag_mask"_a,
            "done_callback"_a, "fail_callback"_a)
+      .def("flush", &Client::flush, "done_callback"_a, "fail_callback"_a)
       .def("evaluate_perf", &Client::evaluate_perf, "msg_size"_a);
 }

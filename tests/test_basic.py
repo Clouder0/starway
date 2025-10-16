@@ -178,6 +178,82 @@ async def test_server_send_with_flush_good(port):
     p_server.close()
 
 
+def client_send(port, with_flush: bool = False):
+    import os
+
+    os.environ["UCS_TLS"] = "tcp"  # force use tcp
+
+    async def inner():
+        client = Client()
+        await client.aconnect(SERVER_ADDR, port)
+        send_buf = np.arange(
+            1024 * 1024 * 1024 * 8, dtype=np.uint8
+        )  # must be big enough to be 'on the flight'
+        await client.asend(send_buf, 0)
+        if with_flush:
+            await client.aflush()
+            print("Client flush done")
+        await client.aclose()
+
+    asyncio.run(inner())
+
+
+async def test_client_send_without_flush_bad(port):
+    server = Server()
+    server.listen(SERVER_ADDR, port)
+    connected = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def accept_cb(_):
+        loop.call_soon_threadsafe(connected.set)
+
+    server.set_accept_cb(accept_cb)
+    ctx = mp.get_context("spawn")
+    p_client = ctx.Process(target=client_send, args=(port, False))
+    p_client.start()
+    await connected.wait()
+    recv_buf = np.zeros(1024 * 1024 * 1024 * 8, dtype=np.uint8)
+    done = False
+
+    def done_callback(sender_tag, length):
+        nonlocal done
+        done = True
+
+    def fail_callback(error):
+        nonlocal done
+        done = True
+
+    server.recv(recv_buf, 0, 0, done_callback, fail_callback)
+    await asyncio.sleep(1.0)
+    assert not done
+    p_client.kill()
+    p_client.join()
+    p_client.close()
+    await server.aclose()
+
+
+async def test_client_send_with_flush_good(port):
+    server = Server()
+    server.listen(SERVER_ADDR, port)
+    connected = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def accept_cb(_):
+        loop.call_soon_threadsafe(connected.set)
+
+    server.set_accept_cb(accept_cb)
+    ctx = mp.get_context("spawn")
+    p_client = ctx.Process(target=client_send, args=(port, True))
+    p_client.start()
+    await connected.wait()
+    recv_buf = np.zeros(1024 * 1024 * 1024 * 8, dtype=np.uint8)
+    recv_future = server.arecv(recv_buf, 0, 0)
+    p_client.join()
+    await recv_future
+    p_client.close()
+    await server.aclose()
+
+
 @pytest.mark.parametrize("size", [1, 1024, 4096])
 async def test_message_integrity_various_sizes(port, size):
     async with gen_server_client(port) as server_and_client:

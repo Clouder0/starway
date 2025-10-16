@@ -19,6 +19,8 @@ struct ClientSendArgs;
 struct ClientSendFuture;
 struct ClientRecvArgs;
 struct ClientRecvFuture;
+struct ClientFlushArgs;
+struct ClientFlushFuture;
 
 struct Server;
 struct ServerEndpoint;
@@ -101,6 +103,28 @@ struct ClientPerfArgs {
   size_t msg_size;
 };
 
+struct ClientFlushFuture {
+  ClientFlushFuture(Client *client, auto &&done_callback, auto &&fail_callback)
+    requires UniRef<decltype(done_callback), nb::object> &&
+             UniRef<decltype(fail_callback), nb::object>;
+  ClientFlushFuture(ClientFlushFuture const &) = delete;
+  auto operator=(ClientFlushFuture const &) -> ClientFlushFuture & = delete;
+  ClientFlushFuture(ClientFlushFuture &&) = delete;
+  auto operator=(ClientFlushFuture &&) -> ClientFlushFuture & = delete;
+
+  void set_result();
+  void set_exception(ucs_status_t result);
+
+  Client *client_;
+  void *req_;
+  nb::object done_callback_; // Callable[[ClientFlushFuture], None]
+  nb::object fail_callback_; // Callable[[ClientFlushFuture], None]
+};
+
+struct ClientFlushArgs {
+  ClientFlushFuture *flush_future;
+};
+
 struct Client {
   Client(Context &ctx);
   ~Client();
@@ -124,6 +148,9 @@ struct Client {
             nb::object fail_callback);
   // Callable[[ClientRecvFuture], None]
 
+  void flush(nb::object done_callback, nb::object fail_callback);
+  // Callable[[ClientFlushFuture], None]
+
   double evaluate_perf(size_t msg_size);
   void start_working(std::string addr, uint64_t port);
   void cancel_pending_reqs();
@@ -134,6 +161,7 @@ struct Client {
       0}; // 0: void 1: initialized 2: running 3: closed
   Channel<ClientSendArgs> send_args_;
   Channel<ClientRecvArgs> recv_args_;
+  Channel<ClientFlushArgs> flush_args_;
   std::atomic<uint8_t> perf_status_{0}; // 0: nothing 1: written
   ClientPerfArgs perf_args_;
   double perf_result_;
@@ -142,6 +170,7 @@ struct Client {
   nb::object close_callback_;
   std::set<ClientSendFuture *> send_futures_;
   std::set<ClientRecvFuture *> recv_futures_;
+  std::set<ClientFlushFuture *> flush_futures_;
 };
 
 struct ServerSendFuture {
