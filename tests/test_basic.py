@@ -1,8 +1,8 @@
 import asyncio
 import contextlib
 import gc
+import multiprocessing as mp
 import random
-import time
 
 import numpy as np
 import pytest
@@ -100,6 +100,82 @@ async def test_server_to_client_send_recv(port):
         assert sender_tag == 2
         assert length == len(send_buf)
         np.testing.assert_array_equal(send_buf, recv_buf)
+
+
+def server_send(port, with_flush: bool = False):
+    import os
+
+    os.environ["UCS_TLS"] = "tcp"  # force use tcp
+
+    async def inner():
+        server = Server()
+        server.listen(SERVER_ADDR, port)
+        connected = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def accept_cb(ep):
+            loop.call_soon_threadsafe(connected.set)
+
+        server.set_accept_cb(accept_cb)
+        await connected.wait()
+        ep = next(iter(server.list_clients()))
+        send_buf = np.arange(
+            1024 * 1024 * 1024 * 8, dtype=np.uint8
+        )  # must be big enough to be 'on the flight'
+        # this test may fail if the buffer is too small
+        await server.asend(ep, send_buf, 0)
+        if with_flush:
+            await server.aflush()
+            print("Flush done")
+        await server.aclose()
+
+    asyncio.run(inner())
+
+
+async def test_server_send_without_flush_bad(port):
+    # use spawn
+    ctx = mp.get_context("spawn")
+    p_server = ctx.Process(target=server_send, args=(port, False))
+    p_server.start()
+    await asyncio.sleep(0.2)
+    client = Client()
+    await client.aconnect(SERVER_ADDR, port)
+    recv_buf = np.zeros(1024 * 1024 * 1024 * 8, dtype=np.uint8)
+    done = False
+
+    def done_callback(sender_tag, length):
+        nonlocal done
+        done = True
+
+    def fail_callback(error):
+        nonlocal done
+        done = True
+
+    # Client posts a receive buffer
+    client.recv(recv_buf, 0, 0, done_callback, fail_callback)
+    # will never be called
+    await asyncio.sleep(1.0)
+    assert not done
+    await client.aclose()
+    p_server.kill()
+    p_server.join()
+    p_server.close()
+
+
+async def test_server_send_with_flush_good(port):
+    ctx = mp.get_context("spawn")
+    p_server = ctx.Process(target=server_send, args=(port, True))
+    p_server.start()
+    await asyncio.sleep(0.2)
+    client = Client()
+    await client.aconnect(SERVER_ADDR, port)
+    recv_buf = np.zeros(1024 * 1024 * 1024 * 8, dtype=np.uint8)
+    # Client posts a receive buffer
+    recv_future = client.arecv(recv_buf, 0, 0)
+    p_server.join()
+    await recv_future
+    await client.aclose()
+    p_server.close()
 
 
 @pytest.mark.parametrize("size", [1, 1024, 4096])

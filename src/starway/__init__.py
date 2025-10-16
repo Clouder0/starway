@@ -52,11 +52,11 @@ else:
 
 
 from ._bindings import Client as _Client  # type: ignore # noqa: E402
-from ._bindings import Context  # type: ignore  # noqa: E402
-from ._bindings import Server as _Server  # type: ignore # noqa: E402
-from ._bindings import (  # type: ignore # noqa: E402
-    ServerEndpoint as _ServerEndpoint,
+from ._bindings import (  # noqa: E402 # type: ignore
+    Context,
+    ServerEndpoint,
 )
+from ._bindings import Server as _Server  # type: ignore # noqa: E402
 
 
 def check_sys_libs() -> Literal["system"] | Literal["wheel"]:
@@ -74,7 +74,7 @@ class Server:
     def listen(self, addr: str, port: int):
         self._server.listen(addr, port)
 
-    def set_accept_cb(self, on_accept: Callable[[_ServerEndpoint], None]):
+    def set_accept_cb(self, on_accept: Callable[[ServerEndpoint], None]):
         self._server.set_accept_callback(on_accept)
 
     def aclose(self, loop: asyncio.AbstractEventLoop | None = None):
@@ -94,7 +94,7 @@ class Server:
 
     def send(
         self,
-        client_ep: _ServerEndpoint,
+        client_ep: ServerEndpoint,
         buffer: NDArray[np.uint8],
         tag: int,
         done_callback: Callable[[], None],
@@ -104,7 +104,7 @@ class Server:
 
     def asend(
         self,
-        client_ep: _ServerEndpoint,
+        client_ep: ServerEndpoint,
         buffer: Annotated[NDArray[np.uint8], dict(shape=(None,), device="cpu")],
         tag: int,
         loop: asyncio.AbstractEventLoop | None = None,
@@ -152,8 +152,28 @@ class Server:
         self._server.recv(buffer, tag, tag_mask, cur_send, cur_fail)
         return ret
 
-    def evaluate_perf(self, client_ep: _ServerEndpoint, msg_size: int) -> float:
+    def flush(
+        self, done_callback: Callable[[], None], fail_callback: Callable[[str], None]
+    ):
+        return self._server.flush(done_callback, fail_callback)
+
+    def aflush(self, loop: asyncio.AbstractEventLoop | None = None):
+        if loop is None:
+            loop = asyncio.get_running_loop()
+        ret: asyncio.Future[None] = asyncio.Future(loop=loop)
+
+        def cur_send():
+            ret.get_loop().call_soon_threadsafe(ret.set_result, None)
+
+        def cur_fail(reason: str):
+            ret.get_loop().call_soon_threadsafe(ret.set_exception, Exception(reason))
+
+        self._server.flush(cur_send, cur_fail)
+        return ret
+
+    def evaluate_perf(self, client_ep: ServerEndpoint, msg_size: int) -> float:
         return self._server.evaluate_perf(client_ep, msg_size)
+
 
 class Client:
     def __init__(self):
@@ -245,7 +265,7 @@ class Client:
 
         self._client.send(buffer, tag, cur_send, cur_fail)
         return ret
-    
+
     def evaluate_perf(self, msg_size: int) -> float:
         return self._client.evaluate_perf(msg_size)
 
@@ -256,6 +276,6 @@ class Client:
 __all__ = [
     "Server",
     "Client",
-    "check_sys_libs",
+    "ServerEndpointcheck_sys_libs",
     # "ucp_get_version",
-]
+]  # type: ignore

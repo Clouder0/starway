@@ -1,6 +1,6 @@
 [project]
 name = "starway"
-version = "0.4.0"
+version = "0.5.0"
 description = "Starway UCX P2P communication lib."
 readme = "README.md"
 authors = [
@@ -27,7 +27,8 @@ build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
 cmake.version = ">=3.27"
-cmake.build-type = "Release"
+# cmake.build-type = "Release"
+cmake.build-type = "Debug"
 sdist.reproducible = true
 sdist.cmake = false
 wheel.packages = ["src/starway"]

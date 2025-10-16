@@ -195,11 +195,43 @@ struct ServerRecvArgs {
   size_t buf_size;
 };
 
+struct ServerFlushFuture {
+  ServerFlushFuture(Server *server, auto &&done_callback, auto &&fail_callback)
+    requires UniRef<decltype(done_callback), nb::object> &&
+             UniRef<decltype(fail_callback), nb::object>;
+  ServerFlushFuture(ServerFlushFuture const &) = delete;
+  auto operator=(ServerFlushFuture const &) -> ServerFlushFuture & = delete;
+  ServerFlushFuture(ServerFlushFuture &&) = default;
+  auto operator=(ServerFlushFuture &&) -> ServerFlushFuture & = default;
+  void set_result();
+  void set_exception(ucs_status_t result);
+
+  Server *server_; // Server should outlives ServerFlushFuture
+  void *req_;
+  nb::object done_callback_; // Callable[[ServerFlushFuture], None]
+  nb::object fail_callback_; // Callable[[ServerFlushFuture], None]
+};
+
+struct ServerFlushArgs {
+  ServerFlushFuture *flush_future;
+};
+
+struct ServerFlushEpFuture {
+  ServerFlushEpFuture(Server *server, auto &&done_callback, auto &&fail_callback)
+    requires UniRef<decltype(done_callback), nb::object> &&
+             UniRef<decltype(fail_callback), nb::object>;
+  ServerFlushEpFuture(ServerFlushEpFuture const &) = delete;
+  auto operator=(ServerFlushEpFuture const &) -> ServerFlushEpFuture & = delete;
+  ServerFlushEpFuture(ServerFlushEpFuture &&) = default;
+  auto operator=(ServerFlushEpFuture &&) -> ServerFlushEpFuture & = default;
+  void set_result();
+  void set_exception(ucs_status_t result);
+};
+
 struct ServerPerfArgs {
   ucp_ep_h ep;
   size_t msg_size;
 };
-
 
 struct ServerEndpoint {
   ucp_ep_h ep;
@@ -238,6 +270,13 @@ struct Server {
             nb::object fail_callback);
   // Callable[[ServerRecvFuture], None]
 
+  void flush(nb::object done_callback, nb::object fail_callback);
+  // Callable[[ServerFlushFuture], None]
+
+  void flush_ep(ServerEndpoint const &client_ep, nb::object done_callback,
+                nb::object fail_callback);
+  // Callable[[ServerFlushEpFuture], None]
+
   auto list_clients() const -> std::set<ServerEndpoint> const &;
   double evaluate_perf(ServerEndpoint const &client_ep, size_t msg_size);
 
@@ -250,6 +289,7 @@ struct Server {
       0}; // 0: void 1: initialized 2: running 3: to close  4: closed
   Channel<ServerSendArgs> send_args_;
   Channel<ServerRecvArgs> recv_args_;
+  Channel<ServerFlushArgs> flush_args_;
   std::atomic<uint8_t> perf_status_{0}; // 0: nothing 1: written
   ServerPerfArgs perf_args_;
   double perf_result_;
@@ -258,4 +298,5 @@ struct Server {
   std::set<ServerEndpoint> eps_;
   std::set<ServerSendFuture *> send_futures_;
   std::set<ServerRecvFuture *> recv_futures_;
+  std::set<ServerFlushFuture *> flush_futures_;
 };
