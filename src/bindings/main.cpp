@@ -668,6 +668,26 @@ void ServerFlushFuture::set_exception(ucs_status_t result) {
   fail_callback_(nb::cast(ucs_status_string(result)));
 }
 
+ServerFlushEpFuture::ServerFlushEpFuture(Server *server, ucp_ep_h ep,
+                                         auto &&done_callback,
+                                         auto &&fail_callback)
+  requires UniRef<decltype(done_callback), nb::object> &&
+               UniRef<decltype(fail_callback), nb::object>
+    : server_(server), ep_(ep), req_(nullptr),
+      done_callback_(std::forward<decltype(done_callback)>(done_callback)),
+      fail_callback_(std::forward<decltype(fail_callback)>(fail_callback)) {}
+void ServerFlushEpFuture::set_result() {
+  debug_print("Server Flush Ep Future done.");
+  assert(done_callback_.is_valid());
+  done_callback_();
+}
+void ServerFlushEpFuture::set_exception(ucs_status_t result) {
+  fatal_print("Server Flush Ep Future failed with {}.",
+              ucs_status_string(result));
+  assert(fail_callback_.is_valid());
+  fail_callback_(nb::cast(ucs_status_string(result)));
+}
+
 auto ServerEndpoint::view_transports() const
     -> std::vector<std::tuple<char const *, char const *>> {
   std::vector<std::tuple<char const *, char const *>> res;
@@ -772,6 +792,23 @@ void server_flush_cb(void *req, ucs_status_t status, void *user_data) {
       flush_future->set_exception(status);
     }
     flush_future->server_->flush_futures_.erase(flush_future);
+    delete flush_future;
+  }
+  ucp_request_free(req);
+}
+void server_flush_ep_cb(void *req, ucs_status_t status, void *user_data) {
+  auto *flush_future = reinterpret_cast<ServerFlushEpFuture *>(user_data);
+  {
+    nb::gil_scoped_acquire acquire;
+    if (status == UCS_OK) {
+      debug_print("Server: waited flush-ep future done.");
+      flush_future->set_result();
+    } else {
+      fatal_print("Server: waited flush-ep future done. Bad status. {}",
+                  ucs_status_string(status));
+      flush_future->set_exception(status);
+    }
+    flush_future->server_->flush_ep_futures_.erase(flush_future);
     delete flush_future;
   }
   ucp_request_free(req);
@@ -923,6 +960,34 @@ void Server::start_working(std::string addr, uint16_t port) {
         return;
       }
     });
+    flush_ep_args_.try_consume([&](auto *ptr) {
+      debug_print("Server: handle flush-ep message.");
+      ServerFlushEpArgs &args = *ptr;
+      ucp_request_param_t param{.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                                                UCP_OP_ATTR_FIELD_USER_DATA,
+                                .cb{.send = server_flush_ep_cb},
+                                .user_data = args.flush_future};
+      auto *req = ucp_ep_flush_nbx(args.ep, &param);
+      if (UCS_PTR_STATUS(req) == UCS_OK) {
+        debug_print("Server: flush-ep success immediately");
+        nb::gil_scoped_acquire acquire;
+        args.flush_future->set_result();
+        delete args.flush_future;
+        return;
+      } else if (UCS_PTR_IS_ERR(req)) {
+        fatal_print("Server: flush-ep failed with {}",
+                    ucs_status_string(UCS_PTR_STATUS(req)));
+        nb::gil_scoped_acquire acquire;
+        args.flush_future->set_exception(UCS_PTR_STATUS(req));
+        delete args.flush_future;
+        return;
+      } else {
+        debug_print("Server: async flush-ep future created pending.");
+        args.flush_future->req_ = req;
+        flush_ep_futures_.emplace(args.flush_future);
+        return;
+      }
+    });
     if (perf_status_.load(std::memory_order_acquire) == 1) {
       ucp_ep_evaluate_perf_attr_t perf_attr{
           .field_mask = UCP_EP_PERF_ATTR_FIELD_ESTIMATED_TIME,
@@ -950,6 +1015,7 @@ void Server::start_working(std::string addr, uint16_t port) {
   send_args_.close();
   recv_args_.close();
   flush_args_.close();
+  flush_ep_args_.close();
   cancel_pending_reqs();
 
   // first close listener to avoid more incoming conns
@@ -967,6 +1033,8 @@ void Server::start_working(std::string addr, uint16_t port) {
                                                      recv_futures_.end()};
     std::vector<ServerFlushFuture *> cur_flush_futures{flush_futures_.begin(),
                                                        flush_futures_.end()};
+    std::vector<ServerFlushEpFuture *> cur_flush_ep_futures{
+        flush_ep_futures_.begin(), flush_ep_futures_.end()};
 
     for (auto *p : cur_send_futures) {
       assert(ucp_request_check_status(p->req_) == UCS_INPROGRESS);
@@ -978,6 +1046,10 @@ void Server::start_working(std::string addr, uint16_t port) {
       ucp_request_cancel(worker, p->req_);
     }
     for (auto *p : cur_flush_futures) {
+      assert(ucp_request_check_status(p->req_) == UCS_INPROGRESS);
+      ucp_request_cancel(worker, p->req_);
+    }
+    for (auto *p : cur_flush_ep_futures) {
       assert(ucp_request_check_status(p->req_) == UCS_INPROGRESS);
       ucp_request_cancel(worker, p->req_);
     }
@@ -1103,6 +1175,27 @@ void Server::flush(nb::object done_callback, nb::object fail_callback) {
   }
 }
 
+void Server::flush_ep(ServerEndpoint const &client_ep, nb::object done_callback,
+                      nb::object fail_callback) {
+  if (status_.load(std::memory_order_acquire) != 2) [[unlikely]] {
+    throw std::runtime_error(
+        "Server: not running. You can only flush ep, after listen.");
+  }
+  auto p_future = new ServerFlushEpFuture(this, client_ep.ep,
+                                          std::move(done_callback),
+                                          std::move(fail_callback));
+  {
+    nb::gil_scoped_release release;
+    auto success = flush_ep_args_.wait_emplace([&](auto *ptr) {
+      new (ptr) ServerFlushEpArgs(p_future, client_ep.ep);
+    });
+    if (!success) [[unlikely]] {
+      p_future->set_exception(UCS_ERR_NOT_CONNECTED);
+      delete p_future;
+    }
+  }
+}
+
 auto Server::list_clients() const -> std::set<ServerEndpoint> const & {
   return eps_;
 }
@@ -1123,6 +1216,12 @@ void Server::cancel_pending_reqs() {
   });
   flush_args_.try_consume([&](auto *ptr) {
     ServerFlushArgs &args = *ptr;
+    nb::gil_scoped_acquire acquire;
+    args.flush_future->set_exception(UCS_ERR_CANCELED);
+    delete args.flush_future;
+  });
+  flush_ep_args_.try_consume([&](auto *ptr) {
+    ServerFlushEpArgs &args = *ptr;
     nb::gil_scoped_acquire acquire;
     args.flush_future->set_exception(UCS_ERR_CANCELED);
     delete args.flush_future;
@@ -1183,6 +1282,8 @@ NB_MODULE(_bindings, m) {
       .def("recv", &Server::recv, "buffer"_a, "tag"_a, "tag_mask"_a,
            "done_callback"_a, "fail_callback"_a)
       .def("flush", &Server::flush, "done_callback"_a, "fail_callback"_a)
+      .def("flush_ep", &Server::flush_ep, "client_ep"_a, "done_callback"_a,
+           "fail_callback"_a)
       .def("list_clients", &Server::list_clients,
            nb::rv_policy::reference_internal)
       .def("evaluate_perf", &Server::evaluate_perf, "client_ep"_a,

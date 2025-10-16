@@ -171,6 +171,32 @@ class Server:
         self._server.flush(cur_send, cur_fail)
         return ret
 
+    def flush_ep(
+        self,
+        client_ep: ServerEndpoint,
+        done_callback: Callable[[], None],
+        fail_callback: Callable[[str], None],
+    ):
+        return self._server.flush_ep(client_ep, done_callback, fail_callback)
+
+    def aflush_ep(
+        self,
+        client_ep: ServerEndpoint,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ):
+        if loop is None:
+            loop = asyncio.get_running_loop()
+        ret: asyncio.Future[None] = asyncio.Future(loop=loop)
+
+        def cur_send():
+            ret.get_loop().call_soon_threadsafe(ret.set_result, None)
+
+        def cur_fail(reason: str):
+            ret.get_loop().call_soon_threadsafe(ret.set_exception, Exception(reason))
+
+        self._server.flush_ep(client_ep, cur_send, cur_fail)
+        return ret
+
     def evaluate_perf(self, client_ep: ServerEndpoint, msg_size: int) -> float:
         return self._server.evaluate_perf(client_ep, msg_size)
 

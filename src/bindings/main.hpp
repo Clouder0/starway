@@ -246,7 +246,8 @@ struct ServerFlushArgs {
 };
 
 struct ServerFlushEpFuture {
-  ServerFlushEpFuture(Server *server, auto &&done_callback, auto &&fail_callback)
+  ServerFlushEpFuture(Server *server, ucp_ep_h ep, auto &&done_callback,
+                      auto &&fail_callback)
     requires UniRef<decltype(done_callback), nb::object> &&
              UniRef<decltype(fail_callback), nb::object>;
   ServerFlushEpFuture(ServerFlushEpFuture const &) = delete;
@@ -255,6 +256,17 @@ struct ServerFlushEpFuture {
   auto operator=(ServerFlushEpFuture &&) -> ServerFlushEpFuture & = default;
   void set_result();
   void set_exception(ucs_status_t result);
+
+  Server *server_;
+  ucp_ep_h ep_;
+  void *req_;
+  nb::object done_callback_; // Callable[[ServerFlushEpFuture], None]
+  nb::object fail_callback_; // Callable[[ServerFlushEpFuture], None]
+};
+
+struct ServerFlushEpArgs {
+  ServerFlushEpFuture *flush_future;
+  ucp_ep_h ep;
 };
 
 struct ServerPerfArgs {
@@ -319,6 +331,7 @@ struct Server {
   Channel<ServerSendArgs> send_args_;
   Channel<ServerRecvArgs> recv_args_;
   Channel<ServerFlushArgs> flush_args_;
+  Channel<ServerFlushEpArgs> flush_ep_args_;
   std::atomic<uint8_t> perf_status_{0}; // 0: nothing 1: written
   ServerPerfArgs perf_args_;
   double perf_result_;
@@ -328,4 +341,5 @@ struct Server {
   std::set<ServerSendFuture *> send_futures_;
   std::set<ServerRecvFuture *> recv_futures_;
   std::set<ServerFlushFuture *> flush_futures_;
+  std::set<ServerFlushEpFuture *> flush_ep_futures_;
 };
