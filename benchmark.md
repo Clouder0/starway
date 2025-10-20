@@ -149,4 +149,3 @@ passed via the shell environment prior to launching the benchmark.
   enhancement.
 - The CLI operates over a single connection pair; for many-to-many topologies,
   users should orchestrate multiple clients.
-
