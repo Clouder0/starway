@@ -27,8 +27,8 @@ build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
 cmake.version = ">=3.27"
-# cmake.build-type = "Release"
-cmake.build-type = "Debug"
+cmake.build-type = "Release"
+# cmake.build-type = "Debug"
 sdist.reproducible = true
 sdist.cmake = false
 wheel.packages = ["src/starway"]

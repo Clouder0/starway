@@ -57,6 +57,7 @@ from ._bindings import (  # noqa: E402 # type: ignore
     ServerEndpoint,
 )
 from ._bindings import Server as _Server  # type: ignore # noqa: E402
+from .benchmarks import list_scenarios as list_benchmark_scenarios  # noqa: E402
 
 
 def check_sys_libs() -> Literal["system"] | Literal["wheel"]:
@@ -352,5 +353,6 @@ __all__ = [
     "Client",
     "ServerEndpoint",
     "check_sys_libs",
+    "list_benchmark_scenarios",
     # "ucp_get_version",
 ]  # type: ignore
