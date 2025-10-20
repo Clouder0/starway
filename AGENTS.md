@@ -1,6 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
+
 - `src/starway/` exposes the typed Python API, built atop the nanobind extension and intended entry points such as `Client` and `Server`.
 - `src/bindings/` hosts the C++20 sources compiled into `_bindings` via nanobind; edit here for UCX-level changes and keep `main.cpp` aligned with `main.hpp`.
 - `tests/` contains asyncio-heavy integration tests (`test_basic.py`) that validate bidirectional messaging and flushing semantics; mirror this structure for new cases.
@@ -8,6 +9,7 @@
 - Top-level `CMakeLists.txt` and `CMakePresets.json` define the native build; update presets when introducing new toolchains or flags.
 
 ## Build, Test, and Development Commands
+
 - `uv sync --group dev --group test` installs Python, nanobind, and test dependencies declared in `pyproject.toml`.
 - `uv run python -m pip install -e .` performs an editable install, triggering scikit-build to compile `_bindings` against your UCX toolchain.
 - `uv run cmake --preset gcc-debug` followed by `uv run cmake --build --preset gcc-debug` configures and rebuilds the native layer directly when iterating on C++ changes.
@@ -15,20 +17,38 @@
 - `uv run pytest tests/test_basic.py -vv` executes the asynchronous regression suite; run the full suite before submitting changes.
 
 ## Coding Style & Naming Conventions
+
 - Python code follows Ruff-enforced rules (`E4`, `E7`, `E9`, `F`, `I`); keep modules and functions `snake_case`, prefer explicit type hints, and use 4-space indentation.
 - C++ sources target C++20, favor RAII helpers like `WorkerOwner`, and mirror the existing brace placement and `std::format`-based logging; add concise comments only for non-obvious UCX interactions.
 - Exported symbols should be re-exported through `src/starway/__init__.py` to preserve the public surface.
 
 ## Testing Guidelines
+
 - Pytest with `pytest-asyncio` drives the suite; structure new tests as coroutine functions named `test_*` and reuse the `gen_server_client` context manager for setup.
 - Long-running transfers rely on `UCS_TLS=tcp`; set this environment variable when reproducing flush-related scenarios locally.
 - Aim to cover both client→server and server→client paths for new features, and ensure buffers are large enough to surface zero-copy behaviour.
 
 ## Commit & Pull Request Guidelines
+
 - Follow the existing Conventional Commit pattern (`feat(Server): flush`, `chore: bump version`); keep subjects imperative and ≤72 characters.
 - Reference issues with `#` tags in the body, describe UCX/runtime toggles touched, and include testing evidence (`uv run pytest …`).
 - Pull requests should summarize behavioural impact, list validation steps, and attach logs or screenshots for performance-sensitive changes.
 
 ## UCX & Runtime Configuration
+
 - Use `STARWAY_USE_SYSTEM_UCX` to choose between system libraries and the fallback `libucx-cu12` wheel; document any change to the default in release notes.
 - When testing RDMA paths, note additional environment variables (e.g., `UCS_TLS`, `UCX_LOG_LEVEL`) so reviewers can reproduce the setup.
+
+## Development Cycle
+
+1. Modify `src/bindings` cpp code to implement underlying utilities. First add declarations in `src/bindings/main.hpp`, then add corresponding implementations in `src/bindings/main.cpp`, afterwards add Python binding at the bottom using nanobind.
+2. After C++ side is done, modify `src/starway/_bindings.pyi` type stub to be inline with the C++ core package, then modify `src/starway/__init__.py` to provide a Python wrapping.
+3. Add testing code inside `tests/`, after that, use pytest to run relavent tests. Pytest should be run by first activating the environment `source .venv/bin/activate.fish`, after that run `pytest -k <pattern>`.
+
+## Agent Notes
+
+- Worker-address connections rely on an Active Message handshake (`kAddressHandshakeAmId`); the server registers the AM handler during `listen_address()` and funnels both listener and handshake endpoints through `Server::handle_new_endpoint` so the Python accept callback remains consistent.
+- `Server.listen_address()` starts a worker thread without creating a listener; always call `get_worker_address()` or keep the bytes returned from `listen_address()` for clients to use `Client.aconnect_address`.
+- `Server.list_clients()` returns a `set[ServerEndpoint]`; capture `next(iter(...))` instead of indexing, and expect socket fields to be empty in worker-address mode.
+- New pytest coverage lives in `tests/test_basic.py` under the `worker_address_` prefix; run `uv run pytest -k "worker_address" -vv` (with escalated permissions if the uv cache path needs it) before broader regressions.
+- UCX prints fatal warnings if clients or servers are left open; always `await client.aclose()` and `await server.aclose()` in tests or examples to avoid destructor aborts.

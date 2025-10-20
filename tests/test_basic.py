@@ -58,6 +58,91 @@ async def test_server_listen_client_connect_close(port):
     await server.aclose()
 
 
+async def test_worker_address_connection_roundtrip():
+    server = Server()
+    server_address = server.listen_address()
+    assert isinstance(server_address, bytes)
+    assert server.get_worker_address() == server_address
+
+    client = Client()
+    await client.aconnect_address(server_address)
+
+    for _ in range(100):
+        if server.list_clients():
+            break
+        await asyncio.sleep(0.01)
+
+    client_list = server.list_clients()
+    assert len(client_list) == 1
+    client_ep = next(iter(client_list))
+
+    send_buf = np.arange(16, dtype=np.uint8)
+    recv_buf_client = np.zeros_like(send_buf)
+    recv_task_client = client.arecv(recv_buf_client, 0, 0)
+    await asyncio.sleep(0.01)
+    await server.asend(client_ep, send_buf, 1)
+    sender_tag, length = await recv_task_client
+    assert sender_tag == 1
+    assert length == len(send_buf)
+    np.testing.assert_array_equal(send_buf, recv_buf_client)
+
+    recv_buf_server = np.zeros_like(send_buf)
+    recv_task_server = server.arecv(recv_buf_server, 0, 0)
+    await asyncio.sleep(0.01)
+    await client.asend(send_buf, 2)
+    sender_tag_server, length_server = await recv_task_server
+    assert sender_tag_server == 2
+    assert length_server == len(send_buf)
+    np.testing.assert_array_equal(send_buf, recv_buf_server)
+
+    assert isinstance(client.get_worker_address(), bytes)
+
+    await client.aclose()
+    await server.aclose()
+
+
+async def test_worker_address_accept_callback_invoked():
+    server = Server()
+    accept_event = asyncio.Event()
+    accepted_eps: list = []
+    loop = asyncio.get_running_loop()
+
+    def accept_cb(ep):
+        accepted_eps.append(ep)
+        loop.call_soon_threadsafe(accept_event.set)
+
+    server.set_accept_cb(accept_cb)
+    server_address = server.listen_address()
+    client = Client()
+
+    await client.aconnect_address(server_address)
+    await asyncio.wait_for(accept_event.wait(), timeout=2.0)
+
+    client_list = server.list_clients()
+    assert len(accepted_eps) == 1
+    assert len(client_list) == 1
+
+    await client.aclose()
+    await server.aclose()
+
+
+async def test_worker_address_multiple_clients():
+    server = Server()
+    server_address = server.listen_address()
+    clients = [Client() for _ in range(3)]
+
+    try:
+        await asyncio.gather(*(c.aconnect_address(server_address) for c in clients))
+        for _ in range(200):
+            if len(server.list_clients()) >= len(clients):
+                break
+            await asyncio.sleep(0.01)
+        assert len(server.list_clients()) >= len(clients)
+    finally:
+        await asyncio.gather(*(c.aclose() for c in clients), return_exceptions=True)
+        await server.aclose()
+
+
 async def test_client_to_server_send_recv(port):
     async with gen_server_client(port) as (server, client):
         send_buf = np.arange(10, dtype=np.uint8)
@@ -167,7 +252,7 @@ async def test_server_send_without_flush_bad(port):
     ctx = mp.get_context("spawn")
     p_server = ctx.Process(target=server_send, args=(port, False))
     p_server.start()
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.5)
     client = Client()
     await client.aconnect(SERVER_ADDR, port)
     recv_buf = np.zeros(1024 * 1024 * 1024 * 8, dtype=np.uint8)
@@ -196,7 +281,7 @@ async def test_server_send_with_flush_good(port):
     ctx = mp.get_context("spawn")
     p_server = ctx.Process(target=server_send, args=(port, True))
     p_server.start()
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.5)
     client = Client()
     await client.aconnect(SERVER_ADDR, port)
     recv_buf = np.zeros(1024 * 1024 * 1024 * 8, dtype=np.uint8)

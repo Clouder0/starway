@@ -1,79 +1,163 @@
 # Starway
 
-Starway aims to be an ultra-fast communication library, which features:
+Starway is an ultra-fast communication library that wraps OpenUCX to deliver
+lock-free, asynchronous, zero-copy messaging for Python applications.
 
-1. Zero Copy, supports sending from pointer and receiving into pre-allocated buffer.
-2. RDMA support, by utilizing OpenMPI/OpenUCX for transportation.
-3. Ease of use, generally should work out of the box, and don't require much configuration efforts.
-4. Full-duplex, asynchronous API.
+## Highlights
 
-Current Python alternatives are lacking core features:
-
-1. ZeroMQ, no support for RDMA.
-2. MPI, hard to use, hard to setup environment properly.
+- Zero-copy transfers into preallocated NumPy buffers.
+- Full-duplex messaging with independent async send/recv APIs.
+- Choice of connection style: traditional TCP socket address or direct UCX
+  worker-address handshakes (no TCP listener required).
+- Flush primitives (`aflush`, `aflush_ep`) to force completion ordering when
+  you need delivery guarantees.
+- Built-in performance probes via `evaluate_perf` for quick transport telemetry.
 
 ## Installation
 
-Starway depends on OpenUCX, which must be linked dynamically. There are two options:
+Starway depends on dynamic OpenUCX libraries:
 
-1. Install OpenUCX system-wide, or whatever method you like as long as it can be found dynamically.
-2. Install `libucx-cu12` wheel package, which contains `libucx.so` files that can be loaded by Starway during initialization.
+1. Install OpenUCX system-wide (for example via your distro's package manager
+   or an HPC toolchain), or
+2. Install the `libucx-cu12` wheel, which ships redistributable shared objects.
 
-We don't add `libucx-cu12`  as Starway Python dependency by default, but generally you can install it on your cluster machines as a fallback option: when libucx cannot be found in system, it would look for wheel installation.
+Starway does not hard-depend on `libucx-cu12`; it is treated as an optional
+fallback.
 
 You can use environment variable to control System/Wheel preference:
 
-```py
+```python
 import os
-os.environ["STARWAY_USE_SYSTEM_UCX"] = "false" # defaults to true
-import starway  # now we will use libucx-cu12 pypi wheel package, while falling back to system if not found
+
+# Defaults to "true". Set to "false" to prefer the wheel first.
+os.environ["STARWAY_USE_SYSTEM_UCX"] = "false"
+
+import starway  # falls back to system UCX if the wheel is unavailable
 ```
 
-## Full-Duplex Communication
+## Quick Start
 
-Starway now supports full-duplex communication, allowing for simultaneous, two-way data exchange between the client and server. This feature significantly improves the library's responsiveness and efficiency in handling real-time data streams.
-
-### Usage
-
-Here's an example of how to use the full-duplex communication feature:
+### Socket-address workflow
 
 ```python
 import asyncio
-import time
 import numpy as np
 from starway import Client, Server
 
-async def tester():
-    server = Server("127.0.0.1", 19198)
-    client = Client("127.0.0.1", 19198)
-    
-    # Client to Server
-    send_buf_c2s = np.arange(10, dtype=np.uint8)
-    recv_buf_c2s = np.empty(10, dtype=np.uint8)
-    
-    # Server to Client
-    send_buf_s2c = np.arange(20, dtype=np.uint8)
-    recv_buf_s2c = np.empty(10, dtype=np.uint8)
+SERVER_ADDR, SERVER_PORT = "127.0.0.1", 19198
 
-    # Wait for client to connect
-    while not (clients := server.list_clients()):
-        time.sleep(0.1)
-    client_ep = clients[0]
 
-    # Perform concurrent send and receive
-    client_send_future = client.asend(send_buf_c2s, tag=1)
-    server_recv_future = server.arecv(recv_buf_c2s, tag=1, tag_mask=0xFFFF)
-    server_send_future = server.asend(client_ep, send_buf_s2c, tag=2)
-    client_recv_future = client.arecv(recv_buf_s2c, tag=2, tag_mask=0xFFFF)
+async def main():
+    server = Server()
+    client = Client()
 
-    await asyncio.gather(
-        client_send_future,
-        server_recv_future,
-        server_send_future,
-        client_recv_future
-    )
+    server.listen(SERVER_ADDR, SERVER_PORT)
+    await client.aconnect(SERVER_ADDR, SERVER_PORT)
 
-    assert np.allclose(send_buf_c2s, recv_buf_c2s)
-    assert np.allclose(send_buf_s2c, recv_buf_s2c)
-    
-asyncio.run(tester())
+    # Establish endpoint object on the server side
+    client_ep = next(iter(server.list_clients()))
+
+    send_buf = np.arange(4, dtype=np.uint8)
+    recv_buf = np.zeros_like(send_buf)
+
+    recv_task = server.arecv(recv_buf, tag=1, tag_mask=0xFFFF)
+    await client.asend(send_buf, tag=1)
+    await recv_task
+
+    await asyncio.gather(client.aflush(), server.aflush_ep(client_ep))
+    await asyncio.gather(client.aclose(), server.aclose())
+
+
+asyncio.run(main())
+```
+
+### Worker-address workflow
+
+```python
+import asyncio
+import numpy as np
+from starway import Client, Server
+
+
+async def main():
+    server = Server()
+    worker_address = server.listen_address()  # bytes blob, no TCP listener
+
+    client = Client()
+    await client.aconnect_address(worker_address)
+
+    # Accept callback still fires; poll list_clients() to obtain the peer ep
+    for _ in range(100):
+        clients = server.list_clients()
+        if clients:
+            client_ep = next(iter(clients))
+            break
+        await asyncio.sleep(0.01)
+
+    recv_buf = np.zeros(4, dtype=np.uint8)
+    recv_task = server.arecv(recv_buf, tag=2, tag_mask=0xFFFF)
+    await client.asend(np.arange(4, dtype=np.uint8), tag=2)
+    await recv_task
+
+    await asyncio.gather(client.aclose(), server.aclose())
+
+
+asyncio.run(main())
+```
+
+## API Cheatsheet
+
+### `Server`
+
+- `listen(addr, port)` – create a TCP-backed listener.
+- `listen_address()` – start worker-only mode and return the local UCX worker
+  address for out-of-band distribution.
+- `set_accept_cb(callback)` – invoked for each new endpoint (both listener and
+  worker-address flows).
+- `list_clients()` – inspect active UCX endpoints.
+- `asend(client_ep, buffer, tag)` / `arecv(buffer, tag, tag_mask)` – async
+  one-sided messaging.
+- `aflush()` – wait for all server-side operations to complete.
+- `aflush_ep(client_ep)` – flush operations targeting a specific endpoint.
+- `evaluate_perf(client_ep, msg_size)` – request UCX transport estimates.
+- `get_worker_address()` – read back the cached worker address bytes.
+- `aclose()` – gracefully shut down and release resources.
+
+### `Client`
+
+- `aconnect(addr, port)` – connect to a listener.
+- `aconnect_address(worker_address)` – connect using a UCX worker address only.
+- `asend(buffer, tag)` / `arecv(buffer, tag, tag_mask)` – async messaging APIs.
+- `aflush()` – wait for in-flight client operations to finish.
+- `evaluate_perf(msg_size)` – ask UCX for local transport estimates.
+- `get_worker_address()` – shareable bytes for reciprocal connections.
+- `aclose()` – close the connection and stop the worker.
+
+### `ServerEndpoint`
+
+Inspect transport metadata for debugging or topology decisions:
+
+- `.name` – UCX endpoint name.
+- `.local_addr`, `.local_port`, `.remote_addr`, `.remote_port` – socket details
+  when available (address-only mode may leave these empty).
+- `.view_transports()` – list `(device, transport)` tuples negotiated by UCX.
+
+## Flushing and Ordering
+
+UCX operations are inherently asynchronous. Starway exposes lightweight futures
+on top of UCX requests and lets you opt into ordering guarantees:
+
+- `Client.aflush()` and `Server.aflush()` drain all pending operations on their
+  respective workers.
+- `Server.aflush_ep(ep)` waits for sends targeting a single endpoint.
+- All async flushes integrate with Python's event loop, making them suitable for
+  structured concurrency patterns (`await asyncio.gather(...)`).
+
+## Testing
+
+Pytest drives the integration suite. Typical commands:
+
+```bash
+uv sync --group dev --group test
+uv run pytest tests/test_basic.py -vv
+```

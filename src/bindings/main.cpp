@@ -8,6 +8,7 @@
 #include <cassert>
 #include <compare>
 #include <format>
+#include <cstring>
 #include <iostream>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
@@ -19,6 +20,15 @@
 
 namespace nb = nanobind;
 using namespace nb::literals;
+
+namespace {
+constexpr uint16_t kAddressHandshakeAmId = 0x7A;
+}
+
+static ucs_status_t
+server_address_handshake_cb(void *arg, void const *header,
+                            size_t header_length, void *data, size_t length,
+                            ucp_am_recv_param_t const *param);
 
 #ifdef NDEBUG
 // --- RELEASE MODE ---
@@ -61,7 +71,7 @@ inline bool static ucp_check_valid_close_status(ucs_status_t status) {
 Context::Context() {
   ucp_params_t params{.field_mask = UCP_PARAM_FIELD_FEATURES |
                                     UCP_PARAM_FIELD_ESTIMATED_NUM_EPS,
-                      .features = UCP_FEATURE_TAG,
+                      .features = UCP_FEATURE_TAG | UCP_FEATURE_AM,
                       .estimated_num_eps = 1};
   ucp_check_status(ucp_init(&params, NULL, &context_),
                    "Failed to init UCP context");
@@ -221,27 +231,49 @@ void client_recv_cb(void *req, ucs_status_t status,
   ucp_request_free(req);
 }
 
-void Client::start_working(std::string addr, uint64_t port) {
+void Client::start_working(ConnectConfig config) {
   // we don't hold GIL from the very beginning of this thread
 
   // utilize RAII for exception handling
   WorkerOwner worker_owner(ctx_);
   ucp_worker_h worker = worker_owner.worker_;
+  {
+    ucp_address_t *worker_addr_ptr{nullptr};
+    size_t worker_addr_len{0};
+    ucp_check_status(
+        ucp_worker_get_address(worker, &worker_addr_ptr, &worker_addr_len),
+        "Client: Failed to get worker address");
+    worker_address_.assign(reinterpret_cast<std::byte *>(worker_addr_ptr),
+                           reinterpret_cast<std::byte *>(worker_addr_ptr) +
+                               worker_addr_len);
+    worker_address_ready_.store(true, std::memory_order_release);
+    ucp_worker_release_address(worker, worker_addr_ptr);
+  }
 
-  struct sockaddr_in connect_addr{
-      .sin_family = AF_INET,
-      .sin_port = htons(static_cast<uint16_t>(port)),
-      .sin_addr = {inet_addr(addr.data())},
-  };
-  ucp_ep_params_t ep_params{
-      .field_mask = UCP_EP_PARAM_FIELD_FLAGS | UCP_EP_PARAM_FIELD_SOCK_ADDR,
-      .flags = UCP_EP_PARAMS_FLAGS_CLIENT_SERVER,
-      .sockaddr =
-          {
-              .addr = reinterpret_cast<struct sockaddr *>(&connect_addr),
-              .addrlen = sizeof(connect_addr),
-          },
-  };
+  sockaddr_in connect_addr{};
+  ucp_ep_params_t ep_params{};
+  if (config.mode == ConnectMode::SockAddr) {
+    connect_addr = {.sin_family = AF_INET,
+                    .sin_port = htons(config.port),
+                    .sin_addr = {inet_addr(config.addr.c_str())}};
+    ep_params.field_mask =
+        UCP_EP_PARAM_FIELD_FLAGS | UCP_EP_PARAM_FIELD_SOCK_ADDR;
+    ep_params.flags = UCP_EP_PARAMS_FLAGS_CLIENT_SERVER;
+    ep_params.sockaddr = {.addr = reinterpret_cast<struct sockaddr *>(
+                              &connect_addr),
+                          .addrlen = sizeof(connect_addr)};
+  } else {
+    if (config.remote_address.empty()) {
+      nb::gil_scoped_acquire acquire;
+      connect_callback_(nb::cast("Client: empty remote UCX address provided"));
+      connect_callback_.reset();
+      status_.store(4, std::memory_order_release);
+      return;
+    }
+    ep_params.field_mask = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS;
+    ep_params.address = reinterpret_cast<ucp_address_t const *>(
+        config.remote_address.data());
+  }
   EpOwner ep_owner(worker_owner.worker_, &ep_params);
   ucp_ep_h ep = ep_owner.ep_;
 
@@ -250,14 +282,6 @@ void Client::start_working(std::string addr, uint64_t port) {
 
   // ensure connection has been established when init
   debug_print("Client: init ep start flushing to ensure connection.");
-  auto connect_success = [&]() {
-    debug_print("Client: init ep flush done");
-    status_.store(2, std::memory_order_release);
-    nb::gil_scoped_acquire acquire;
-    assert(connect_callback_.is_valid());
-    connect_callback_(nb::cast(""));
-    connect_callback_.reset();
-  };
   auto connect_failed = [&](ucs_status_t reason) {
     fatal_print("Client: init ep flush failed: {}", ucs_status_string(reason));
     nb::gil_scoped_acquire acquire;
@@ -265,10 +289,55 @@ void Client::start_working(std::string addr, uint64_t port) {
     connect_callback_(nb::cast(ucs_status_string(reason)));
     connect_callback_.reset();
   };
+  auto send_handshake = [&]() -> ucs_status_t {
+    if (config.mode != ConnectMode::RemoteAddress) {
+      return UCS_OK;
+    }
+    if (!worker_address_ready_.load(std::memory_order_acquire) ||
+        worker_address_.empty()) {
+      return UCS_ERR_INVALID_PARAM;
+    }
+    ucp_request_param_t am_param{};
+    auto *req =
+        ucp_am_send_nbx(ep, kAddressHandshakeAmId, nullptr, 0,
+                        worker_address_.data(), worker_address_.size(),
+                        &am_param);
+    if (req == NULL) {
+      return UCS_OK;
+    }
+    if (UCS_PTR_IS_ERR(req)) {
+      return UCS_PTR_STATUS(req);
+    }
+    while (ucp_request_check_status(req) == UCS_INPROGRESS) {
+      ucp_worker_progress(worker);
+    }
+    auto final_status = ucp_request_check_status(req);
+    ucp_request_free(req);
+    return final_status;
+  };
+  auto connect_success = [&]() -> bool {
+    if (config.mode == ConnectMode::RemoteAddress) {
+      auto handshake_status = send_handshake();
+      if (handshake_status != UCS_OK) {
+        connect_failed(handshake_status);
+        status_.store(4, std::memory_order_release);
+        return false;
+      }
+    }
+    debug_print("Client: init ep flush done");
+    status_.store(2, std::memory_order_release);
+    nb::gil_scoped_acquire acquire;
+    assert(connect_callback_.is_valid());
+    connect_callback_(nb::cast(""));
+    connect_callback_.reset();
+    return true;
+  };
   ucp_request_param_t flush_params{};
   auto status = ucp_ep_flush_nbx(ep, &flush_params);
   if (UCS_PTR_STATUS(status) == UCS_OK) {
-    connect_success();
+    if (!connect_success()) {
+      return;
+    }
   } else if (UCS_PTR_IS_ERR(status)) {
     connect_failed(UCS_PTR_STATUS(status));
     return;
@@ -283,7 +352,9 @@ void Client::start_working(std::string addr, uint64_t port) {
       return;
     }
     ucp_request_free(status);
-    connect_success();
+    if (!connect_success()) {
+      return;
+    }
   }
 
   debug_print("Client: start main loop.");
@@ -474,6 +545,7 @@ void Client::start_working(std::string addr, uint64_t port) {
       fatal_print("Client: close callback is invalid.");
     }
   }
+  worker_address_ready_.store(false, std::memory_order_release);
   status_.store(4, std::memory_order_release);
 }
 
@@ -483,8 +555,41 @@ void Client::connect(std::string addr, uint64_t port, nb::object callback) {
                              "once, and cannot reconnect after close.");
   }
   connect_callback_ = std::move(callback);
-  working_thread_ =
-      std::thread([this, addr, port]() { this->start_working(addr, port); });
+  ConnectConfig config{.mode = ConnectMode::SockAddr,
+                       .addr = std::move(addr),
+                       .port = static_cast<uint16_t>(port),
+                       .remote_address = {}};
+  working_thread_ = std::thread(
+      [this, config = std::move(config)]() mutable {
+        this->start_working(std::move(config));
+      });
+}
+void Client::connect_address(nb::bytes remote_address, nb::object callback) {
+  if (status_.load(std::memory_order_acquire) != 0) {
+    throw std::runtime_error("Client: already connected. You can only connect "
+                             "once, and cannot reconnect after close.");
+  }
+  connect_callback_ = std::move(callback);
+  ConnectConfig config{.mode = ConnectMode::RemoteAddress,
+                       .addr = {},
+                       .port = 0,
+                       .remote_address = {}};
+  auto data_view = remote_address.c_str();
+  auto data_size = remote_address.size();
+  config.remote_address.resize(data_size);
+  std::memcpy(config.remote_address.data(), data_view, data_size);
+  working_thread_ = std::thread(
+      [this, config = std::move(config)]() mutable {
+        this->start_working(std::move(config));
+      });
+}
+nb::bytes Client::get_worker_address() {
+  if (!worker_address_ready_.load(std::memory_order_acquire)) {
+    throw std::runtime_error(
+        "Client: worker address not ready. Connect first before querying.");
+  }
+  return nb::bytes(reinterpret_cast<char const *>(worker_address_.data()),
+                   worker_address_.size());
 }
 void Client::close(nb::object callback) {
   if (status_.load(std::memory_order_acquire) != 2) {
@@ -708,22 +813,66 @@ void Server::set_accept_callback(nb::object accept_callback) {
   accept_callback_ = std::move(accept_callback);
 }
 void Server::listen(std::string addr, uint16_t port) {
-  if (status_.load(std::memory_order_acquire) != 0) {
+  if (status_.load(std::memory_order_acquire) != 0 ||
+      listen_mode_.load(std::memory_order_acquire) != ListenMode::None) {
     throw std::runtime_error("Server: already listening. You can only "
                              "listen once, and cannot listen again after "
                              "close.");
   }
+  listen_mode_.store(ListenMode::SockAddr, std::memory_order_release);
+  worker_address_ready_.store(false, std::memory_order_release);
   nb::gil_scoped_release release;
-  working_thread_ =
-      std::thread([this, addr, port]() { this->start_working(addr, port); });
+  working_thread_ = std::thread([this, addr = std::move(addr), port]() {
+    ListenConfig config{ListenMode::SockAddr, addr, port};
+    this->start_working(std::move(config));
+  });
   while (status_.load(std::memory_order_acquire) != 2) {
     std::this_thread::yield();
   }
 }
 
+void Server::listen_address() {
+  if (status_.load(std::memory_order_acquire) != 0 ||
+      listen_mode_.load(std::memory_order_acquire) != ListenMode::None) {
+    throw std::runtime_error(
+        "Server: already listening. You can only listen once, and cannot "
+        "listen again after close.");
+  }
+  listen_mode_.store(ListenMode::WorkerAddress, std::memory_order_release);
+  worker_address_ready_.store(false, std::memory_order_release);
+  nb::gil_scoped_release release;
+  working_thread_ = std::thread([this]() {
+    ListenConfig config{ListenMode::WorkerAddress, std::string{}, 0};
+    this->start_working(std::move(config));
+  });
+  while (status_.load(std::memory_order_acquire) != 2) {
+    std::this_thread::yield();
+  }
+}
+
+nb::bytes Server::get_worker_address() const {
+  if (!worker_address_ready_.load(std::memory_order_acquire)) {
+    throw std::runtime_error(
+        "Server: worker address not ready. Start listening first.");
+  }
+  return nb::bytes(reinterpret_cast<char const *>(worker_address_.data()),
+                   worker_address_.size());
+}
+
 void server_accept_cb(ucp_ep_h ep, void *arg) {
   auto *cur = reinterpret_cast<Server *>(arg);
+  cur->handle_new_endpoint(ep);
+}
+
+void Server::handle_new_endpoint(ucp_ep_h ep) {
   ServerEndpoint endpoint{};
+  endpoint.ep = ep;
+  endpoint.name = "";
+  endpoint.local_addr = "";
+  endpoint.local_port = 0;
+  endpoint.remote_addr = "";
+  endpoint.remote_port = 0;
+  endpoint.num_transports = 0;
   ucp_ep_attr_t attrs{.field_mask = UCP_EP_ATTR_FIELD_NAME |
                                     UCP_EP_ATTR_FIELD_LOCAL_SOCKADDR |
                                     UCP_EP_ATTR_FIELD_REMOTE_SOCKADDR |
@@ -732,30 +881,107 @@ void server_accept_cb(ucp_ep_h ep, void *arg) {
                                   .num_entries = endpoint.transports.size(),
                                   .entry_size = sizeof(ucp_transport_entry_t)}};
   auto status = ucp_ep_query(ep, &attrs);
+  if (status == UCS_OK) {
+    endpoint.name = attrs.name;
+    endpoint.num_transports = attrs.transports.num_entries;
+    auto *local_addr = reinterpret_cast<sockaddr_in *>(&attrs.local_sockaddr);
+    auto *remote_addr = reinterpret_cast<sockaddr_in *>(&attrs.remote_sockaddr);
+    if (local_addr != nullptr && local_addr->sin_family != 0) {
+      endpoint.local_addr = inet_ntoa(local_addr->sin_addr);
+      endpoint.local_port = ntohs(local_addr->sin_port);
+    }
+    if (remote_addr != nullptr && remote_addr->sin_family != 0) {
+      endpoint.remote_addr = inet_ntoa(remote_addr->sin_addr);
+      endpoint.remote_port = ntohs(remote_addr->sin_port);
+    }
+  } else {
+    fatal_print("Server: failed to query endpoint attributes: {}",
+                ucs_status_string(status));
+  }
+  auto [endpoint_it, inserted] = eps_.emplace(std::move(endpoint));
+  if (!inserted) {
+    return;
+  }
+  auto &endpoint_ref = *endpoint_it;
+  if (accept_callback_.is_valid()) {
+    nb::gil_scoped_acquire acquire;
+    accept_callback_(nb::cast(endpoint_ref));
+  }
+}
+
+void Server::handle_address_handshake(std::byte const *remote_address,
+                                      size_t length) {
+  if (remote_address == nullptr || length == 0) {
+    fatal_print("Server: received empty remote worker address during handshake.");
+    return;
+  }
+  if (status_.load(std::memory_order_acquire) != 2) {
+    return;
+  }
+  auto *worker = worker_;
+  if (worker == nullptr) {
+    return;
+  }
+  std::vector<std::byte> address_copy(remote_address,
+                                      remote_address + length);
+  ucp_ep_params_t params{.field_mask = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS,
+                         .address = reinterpret_cast<ucp_address_t const *>(
+                             address_copy.data())};
+  ucp_ep_h ep{};
+  auto status = ucp_ep_create(worker, &params, &ep);
   if (status != UCS_OK) {
-    fatal_print("Server: ERR when querying ep on connection: {}",
+    fatal_print("Server: failed to create endpoint from worker address: {}",
                 ucs_status_string(status));
     return;
   }
-  sockaddr_in *local_addr =
-      reinterpret_cast<sockaddr_in *>(&attrs.local_sockaddr);
-  sockaddr_in *remote_addr =
-      reinterpret_cast<sockaddr_in *>(&attrs.remote_sockaddr);
-  endpoint.ep = ep;
-  endpoint.name = attrs.name;
-  endpoint.local_addr = inet_ntoa(local_addr->sin_addr);
-  endpoint.local_port = ntohs(local_addr->sin_port);
-  endpoint.remote_addr = inet_ntoa(remote_addr->sin_addr);
-  endpoint.remote_port = ntohs(remote_addr->sin_port);
-  endpoint.num_transports = attrs.transports.num_entries;
-  auto [endpoint_it, _] = cur->eps_.emplace(std::move(endpoint));
-  auto &endpoint_ref = *endpoint_it;
-  {
-    nb::gil_scoped_acquire acquire;
-    if (cur->accept_callback_.is_valid()) {
-      cur->accept_callback_(nb::cast(endpoint_ref));
-    }
+  handle_new_endpoint(ep);
+}
+
+static ucs_status_t
+server_address_handshake_cb(void *arg, void const *header,
+                            size_t header_length, void *data, size_t length,
+                            ucp_am_recv_param_t const *param) {
+  (void)header;
+  (void)header_length;
+  auto *server = reinterpret_cast<Server *>(arg);
+  if (server == nullptr || length == 0) {
+    return UCS_OK;
   }
+  auto *worker = server->worker_;
+  if (worker == nullptr) {
+    return UCS_OK;
+  }
+  if (param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) {
+    std::vector<std::byte> buffer(length);
+    ucp_request_param_t recv_param{};
+    auto *req = ucp_am_recv_data_nbx(worker, data, buffer.data(), length,
+                                     &recv_param);
+    if (req == NULL) {
+      server->handle_address_handshake(buffer.data(), length);
+      return UCS_OK;
+    }
+    if (UCS_PTR_IS_ERR(req)) {
+      fatal_print("Server: failed to complete handshake RNDV receive: {}",
+                  ucs_status_string(UCS_PTR_STATUS(req)));
+      return UCS_OK;
+    }
+    while (ucp_request_check_status(req) == UCS_INPROGRESS) {
+      ucp_worker_progress(worker);
+    }
+    auto final_status = ucp_request_check_status(req);
+    if (final_status == UCS_OK) {
+      server->handle_address_handshake(buffer.data(), length);
+    } else {
+      fatal_print("Server: handshake RNDV receive completed with {}",
+                  ucs_status_string(final_status));
+    }
+    ucp_request_free(req);
+    return UCS_OK;
+  }
+
+  server->handle_address_handshake(
+      reinterpret_cast<std::byte const *>(data), length);
+  return UCS_OK;
 }
 
 auto init_listener_params(std::string_view addr, uint16_t port,
@@ -834,18 +1060,51 @@ void server_recv_cb(void *req, ucs_status_t status,
   ucp_request_free(req);
 }
 
-void Server::start_working(std::string addr, uint16_t port) {
+void Server::start_working(ListenConfig config) {
   debug_print("Server: worker thread started.");
   WorkerOwner worker_owner(ctx_);
-  ucp_worker_h worker = worker_owner.worker_;
+  worker_ = worker_owner.worker_;
+  ucp_worker_h worker = worker_;
   debug_print("Server: worker init.");
 
-  ucp_listener_h listener;
   {
+    ucp_address_t *worker_addr_ptr{nullptr};
+    size_t worker_addr_len{0};
+    auto status =
+        ucp_worker_get_address(worker, &worker_addr_ptr, &worker_addr_len);
+    if (status == UCS_OK) {
+      worker_address_.assign(reinterpret_cast<std::byte *>(worker_addr_ptr),
+                             reinterpret_cast<std::byte *>(worker_addr_ptr) +
+                                 worker_addr_len);
+      worker_address_ready_.store(true, std::memory_order_release);
+      ucp_worker_release_address(worker, worker_addr_ptr);
+    } else {
+      fatal_print("Server: failed to get worker address: {}",
+                  ucs_status_string(status));
+    }
+  }
+
+  ucp_am_handler_param_t am_handler_param{
+      .field_mask = UCP_AM_HANDLER_PARAM_FIELD_ID |
+                    UCP_AM_HANDLER_PARAM_FIELD_CB |
+                    UCP_AM_HANDLER_PARAM_FIELD_ARG,
+      .id = kAddressHandshakeAmId,
+      .cb = server_address_handshake_cb,
+      .arg = this,
+  };
+  auto am_status = ucp_worker_set_am_recv_handler(worker, &am_handler_param);
+  if (am_status != UCS_OK) {
+    fatal_print("Server: failed to register AM handler: {}",
+                ucs_status_string(am_status));
+  }
+
+  bool has_listener = config.mode == ListenMode::SockAddr;
+  ucp_listener_h listener{};
+  if (has_listener) {
     struct sockaddr_in listen_addr{
         .sin_family = AF_INET,
-        .sin_port = htons(static_cast<uint16_t>(port)),
-        .sin_addr = {inet_addr(addr.data())},
+        .sin_port = htons(static_cast<uint16_t>(config.port)),
+        .sin_addr = {inet_addr(config.addr.data())},
     };
     ucp_listener_params_t listener_params{
         .field_mask = UCP_LISTENER_PARAM_FIELD_SOCK_ADDR |
@@ -857,8 +1116,10 @@ void Server::start_working(std::string addr, uint16_t port) {
         .accept_handler{.cb = server_accept_cb, .arg = this}};
     ucp_check_status(ucp_listener_create(worker, &listener_params, &listener),
                      "Server: failed to create listener.");
+    debug_print("Server: listener init.");
+  } else {
+    debug_print("Server: address-only mode: no listener created.");
   }
-  debug_print("Server: listener init.");
 
   status_.store(2, std::memory_order_release);
   debug_print("Server: init done.");
@@ -1018,10 +1279,12 @@ void Server::start_working(std::string addr, uint16_t port) {
   flush_ep_args_.close();
   cancel_pending_reqs();
 
-  // first close listener to avoid more incoming conns
-  debug_print("Server: start close listener.");
-  ucp_listener_destroy(listener);
-  debug_print("Server: done close listener.");
+  if (has_listener) {
+    // first close listener to avoid more incoming conns
+    debug_print("Server: start close listener.");
+    ucp_listener_destroy(listener);
+    debug_print("Server: done close listener.");
+  }
 
   // cancel all existing requests
   debug_print("Server: start cancel requests.");
@@ -1084,6 +1347,17 @@ void Server::start_working(std::string addr, uint16_t port) {
     }
   }
   debug_print("Server: done close endpoints.");
+
+  ucp_am_handler_param_t clear_handler{
+      .field_mask = UCP_AM_HANDLER_PARAM_FIELD_ID |
+                    UCP_AM_HANDLER_PARAM_FIELD_CB,
+      .id = kAddressHandshakeAmId,
+      .cb = nullptr,
+  };
+  ucp_worker_set_am_recv_handler(worker, &clear_handler);
+  worker_address_ready_.store(false, std::memory_order_release);
+  worker_ = nullptr;
+  listen_mode_.store(ListenMode::None, std::memory_order_release);
 
   // invoke  callback
   debug_print("Server: worker thread close done.");
@@ -1276,7 +1550,9 @@ NB_MODULE(_bindings, m) {
       .def(nb::init<Context &>(), "ctx"_a)
       .def("set_accept_callback", &Server::set_accept_callback, "callback"_a)
       .def("listen", &Server::listen, "addr"_a, "port"_a)
+      .def("listen_address", &Server::listen_address)
       .def("close", &Server::close, "callback"_a)
+      .def("get_worker_address", &Server::get_worker_address)
       .def("send", &Server::send, "client_ep"_a, "buffer"_a, "tag"_a,
            "done_callback"_a, "fail_callback"_a)
       .def("recv", &Server::recv, "buffer"_a, "tag"_a, "tag_mask"_a,
@@ -1292,11 +1568,14 @@ NB_MODULE(_bindings, m) {
   nb::class_<Client>(m, "Client")
       .def(nb::init<Context &>(), "ctx"_a)
       .def("connect", &Client::connect, "addr"_a, "port"_a, "callback"_a)
+      .def("connect_address", &Client::connect_address, "remote_address"_a,
+           "callback"_a)
       .def("close", &Client::close, "callback"_a)
       .def("send", &Client::send, "buffer"_a, "tag"_a, "done_callback"_a,
            "fail_callback"_a)
       .def("recv", &Client::recv, "buffer"_a, "tag"_a, "tag_mask"_a,
            "done_callback"_a, "fail_callback"_a)
       .def("flush", &Client::flush, "done_callback"_a, "fail_callback"_a)
-      .def("evaluate_perf", &Client::evaluate_perf, "msg_size"_a);
+      .def("evaluate_perf", &Client::evaluate_perf, "msg_size"_a)
+      .def("get_worker_address", &Client::get_worker_address);
 }

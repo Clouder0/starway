@@ -4,6 +4,8 @@
 #include <atomic>
 #include <cassert>
 #include <compare>
+#include <cstddef>
+#include <cstdint>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/set.h>
@@ -12,6 +14,7 @@
 #include <nanobind/stl/vector.h>
 #include <set>
 #include <type_traits>
+#include <vector>
 #include <ucp/api/ucp_def.h>
 
 struct Client;
@@ -126,6 +129,14 @@ struct ClientFlushArgs {
 };
 
 struct Client {
+  enum class ConnectMode : uint8_t { SockAddr, RemoteAddress };
+  struct ConnectConfig {
+    ConnectMode mode;
+    std::string addr;
+    uint16_t port;
+    std::vector<std::byte> remote_address;
+  };
+
   Client(Context &ctx);
   ~Client();
   // disable copy and move
@@ -135,6 +146,8 @@ struct Client {
   auto operator=(Client &&) -> Client & = delete;
 
   void connect(std::string addr, uint64_t port, nb::object connect_callback);
+  void connect_address(nb::bytes remote_address, nb::object connect_callback);
+  nb::bytes get_worker_address();
   // Callable[[], None]
   void close(nb::object close_callback);
   // Callable[[], None]
@@ -152,7 +165,7 @@ struct Client {
   // Callable[[ClientFlushFuture], None]
 
   double evaluate_perf(size_t msg_size);
-  void start_working(std::string addr, uint64_t port);
+  void start_working(ConnectConfig config);
   void cancel_pending_reqs();
 
   ucp_context_h ctx_;
@@ -168,6 +181,8 @@ struct Client {
 
   nb::object connect_callback_;
   nb::object close_callback_;
+  std::vector<std::byte> worker_address_;
+  std::atomic<bool> worker_address_ready_{false};
   std::set<ClientSendFuture *> send_futures_;
   std::set<ClientRecvFuture *> recv_futures_;
   std::set<ClientFlushFuture *> flush_futures_;
@@ -289,6 +304,13 @@ struct ServerEndpoint {
 };
 
 struct Server {
+  enum class ListenMode : uint8_t { None, SockAddr, WorkerAddress };
+  struct ListenConfig {
+    ListenMode mode;
+    std::string addr;
+    uint16_t port;
+  };
+
   Server(Context &ctx);
   ~Server();
   // disable copy and move
@@ -299,7 +321,9 @@ struct Server {
 
   void set_accept_callback(nb::object accept_callback);
   void listen(std::string addr, uint16_t port);
+  void listen_address();
   void close(nb::object close_callback);
+  nb::bytes get_worker_address() const;
 
   void send(ServerEndpoint const &client_ep,
             nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cpu> const &buffer,
@@ -321,8 +345,11 @@ struct Server {
   auto list_clients() const -> std::set<ServerEndpoint> const &;
   double evaluate_perf(ServerEndpoint const &client_ep, size_t msg_size);
 
-  void start_working(std::string addr, uint16_t port);
+  void start_working(ListenConfig config);
   void cancel_pending_reqs();
+  void handle_new_endpoint(ucp_ep_h ep);
+  void handle_address_handshake(std::byte const *remote_address,
+                                size_t length);
 
   ucp_context_h ctx_;
   std::thread working_thread_;
@@ -335,6 +362,10 @@ struct Server {
   std::atomic<uint8_t> perf_status_{0}; // 0: nothing 1: written
   ServerPerfArgs perf_args_;
   double perf_result_;
+  std::vector<std::byte> worker_address_;
+  std::atomic<bool> worker_address_ready_{false};
+  std::atomic<ListenMode> listen_mode_{ListenMode::None};
+  ucp_worker_h worker_{nullptr};
   nb::object close_callback_;
   nb::object accept_callback_;
   std::set<ServerEndpoint> eps_;

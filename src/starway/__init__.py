@@ -74,6 +74,10 @@ class Server:
     def listen(self, addr: str, port: int):
         self._server.listen(addr, port)
 
+    def listen_address(self) -> bytes:
+        self._server.listen_address()
+        return self.get_worker_address()
+
     def set_accept_cb(self, on_accept: Callable[[ServerEndpoint], None]):
         self._server.set_accept_callback(on_accept)
 
@@ -91,6 +95,9 @@ class Server:
 
     def list_clients(self):
         return self._server.list_clients()
+
+    def get_worker_address(self) -> bytes:
+        return self._server.get_worker_address()
 
     def send(
         self,
@@ -222,6 +229,23 @@ class Client:
         self._client.connect(addr, port, connection_cb)
         return ret
 
+    def aconnect_address(
+        self, remote_address: bytes, loop: asyncio.AbstractEventLoop | None = None
+    ):
+        if loop is None:
+            loop = asyncio.get_running_loop()
+        ret: asyncio.Future[None] = asyncio.Future(loop=loop)
+
+        def connection_cb(status: str):
+            print("Connected!")
+            if status == "":
+                loop.call_soon_threadsafe(ret.set_result, None)
+            else:
+                loop.call_soon_threadsafe(ret.set_exception, Exception(status))
+
+        self._client.connect_address(remote_address, connection_cb)
+        return ret
+
     def aclose(self, loop: asyncio.AbstractEventLoop | None = None):
         if loop is None:
             loop = asyncio.get_running_loop()
@@ -316,6 +340,9 @@ class Client:
     def evaluate_perf(self, msg_size: int) -> float:
         return self._client.evaluate_perf(msg_size)
 
+    def get_worker_address(self) -> bytes:
+        return self._client.get_worker_address()
+
     # def evaluate_perf(self, msg_size: int) -> float:
     # return self._client.evaluate_perf(msg_size)
 
@@ -323,6 +350,7 @@ class Client:
 __all__ = [
     "Server",
     "Client",
-    "ServerEndpointcheck_sys_libs",
+    "ServerEndpoint",
+    "check_sys_libs",
     # "ucp_get_version",
 ]  # type: ignore

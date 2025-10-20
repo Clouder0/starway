@@ -29,12 +29,14 @@ Starway is an ultra-fast communication library for Python that provides zero-cop
 ### Async Pattern: Python asyncio ↔ C++ UCX
 
 The async bridge works by:
+
 - Python methods (e.g., `asend()`, `arecv()`) create `asyncio.Future` objects
 - C++ callbacks are registered with UCX operations
 - On completion, C++ calls Python callbacks via `loop.call_soon_threadsafe()`
 - This allows UCX's native async to integrate with Python's event loop
 
 Example flow:
+
 ```
 Client.asend() → creates Future → _client.send(done_cb, fail_cb)
 → UCX async send → on complete: done_cb()
@@ -44,6 +46,7 @@ Client.asend() → creates Future → _client.send(done_cb, fail_cb)
 ## Build and Development Commands
 
 ### Setup
+
 ```bash
 # Install dependencies (Python, nanobind, test tools)
 uv sync --group dev --group test
@@ -53,6 +56,7 @@ uv run python -m pip install -e .
 ```
 
 ### C++ Development
+
 ```bash
 # Configure CMake with GCC debug preset
 uv run cmake --preset gcc-debug
@@ -62,6 +66,7 @@ uv run cmake --build --preset gcc-debug
 ```
 
 ### Testing
+
 ```bash
 # Run full test suite (asyncio-based integration tests)
 uv run pytest tests/test_basic.py -vv
@@ -74,6 +79,7 @@ UCS_TLS=tcp uv run pytest tests/test_basic.py -vv
 ```
 
 ### Building Distributions
+
 ```bash
 # Build source and wheel distributions
 uv run python -m build
@@ -82,21 +88,25 @@ uv run python -m build
 ## Key Design Decisions
 
 ### UCX Library Loading Strategy
+
 - Controlled by `STARWAY_USE_SYSTEM_UCX` env var (defaults to "true")
 - Fallback chain: system → wheel → error
 - Allows flexibility for different deployment scenarios (HPC clusters vs PyPI installs)
 
 ### Full-Duplex Communication
+
 - Both `Server` and `Client` can send/recv simultaneously
 - Uses UCX tags for message matching (tag + tag_mask)
 - `ServerEndpoint` represents individual connected clients on server side
 
 ### Zero-Copy Support
+
 - Operates directly on NumPy array buffers (`NDArray[np.uint8]`)
 - No intermediate copies between Python and UCX
 - Requires pre-allocated receive buffers
 
 ### Flush Semantics
+
 - `flush()` / `aflush()`: Flush all pending operations for all endpoints
 - `flush_ep()` / `aflush_ep()`: Flush specific client endpoint
 - Critical for ensuring data delivery before cleanup or synchronization
@@ -121,6 +131,7 @@ uv run python -m build
 ## Commit Convention
 
 Follow Conventional Commits pattern:
+
 - `feat(Client): add new feature`
 - `fix(Server): resolve bug`
 - `chore: maintenance task`

@@ -4,11 +4,11 @@ version = "0.5.0"
 description = "Starway UCX P2P communication lib."
 readme = "README.md"
 authors = [
-    { name = "Clouder0", email = "clouder0@outlook.com" }
+  { name = "Clouder0", email = "clouder0@outlook.com" },
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>=2.0.0",
+  "numpy>=2.0.0",
 ]
 
 # [build-system]
@@ -39,12 +39,12 @@ editable.rebuild = false
 
 [dependency-groups]
 dev = [
-    "nanobind>=2.9.2",
+  "nanobind>=2.9.2",
 ]
 test = [
-    "pytest>=8.4.2",
-    "pytest-asyncio>=1.1.0",
-    "uvloop>=0.21.0",
+  "pytest>=8.4.2",
+  "pytest-asyncio>=1.1.0",
+  "uvloop>=0.21.0",
 ]
 
 [tool.ruff.lint]
@@ -52,12 +52,12 @@ select = ["E4", "E7", "E9", "F", "I"]
 ignore = []
 
 [tool.cibuildwheel]
-repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel} --exclude libucp.so.0 --exclude libuct.so.0 --exclude libucs.so.0 --exclude libucm.so.0 "  # disable repair wheel
+repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel} --exclude libucp.so.0 --exclude libuct.so.0 --exclude libucs.so.0 --exclude libucm.so.0 " # disable repair wheel
 build = [
-    "cp310-manylinux_x86_64",
-    "cp311-manylinux_x86_64",
-    "cp312-manylinux_x86_64",
-    "cp313-manylinux_x86_64",
+  "cp310-manylinux_x86_64",
+  "cp311-manylinux_x86_64",
+  "cp312-manylinux_x86_64",
+  "cp313-manylinux_x86_64",
 ]
 build-frontend = "build[uv]"
 manylinux-x86_64-image = "manylinux_2_34"
@@ -65,5 +65,5 @@ before-all = [
   "yum install -y wget ninja-build cmake libnl3-devel libudev-devel",
   "cd / && curl -L https://github.com/linux-rdma/rdma-core/releases/download/v59.0/rdma-core-59.0.tar.gz -o rdma-core-59.0.tar.gz && tar xf rdma-core-59.0.tar.gz && cd rdma-core-59.0 && cmake -Bbuild -GNinja -DIN_PLACE=0 -DCMAKE_EXPORT_COMPILE_COMMANDS=0  -DCMAKE_BUILD_TYPE=Release  -DENABLE_VALGRIND=0  -DENABLE_STATIC=1  -DNO_MAN_PAGES=1 && cmake --build build -j && cmake --install build",
   "cd / && curl -L https://github.com/openucx/ucx/releases/download/v1.18.1/ucx-1.18.1.tar.gz -o ucx.tar.gz && tar xf ucx.tar.gz",
-  "cd /ucx-1.18.1 && ./contrib/configure-release --disable-doxygen-doc --disable-doxygen-man --disable-doxygen-html --enable-optimizations --enable-tuning  --enable-devel-headers  --with-avx --with-mlx5 --with-rc --with-ud --with-dc --with-ib-hw-tm --with-dm --with-rdmacm=/usr/local && make -j && make install"
+  "cd /ucx-1.18.1 && ./contrib/configure-release --disable-doxygen-doc --disable-doxygen-man --disable-doxygen-html --enable-optimizations --enable-tuning  --enable-devel-headers  --with-avx --with-mlx5 --with-rc --with-ud --with-dc --with-ib-hw-tm --with-dm --with-rdmacm=/usr/local && make -j && make install",
 ]
