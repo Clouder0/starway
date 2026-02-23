@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
   { name = "Clouder0", email = "clouder0@outlook.com" },
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "numpy>=2.0.0",
 ]
@@ -54,7 +54,6 @@ ignore = []
 [tool.cibuildwheel]
 repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel} --exclude libucp.so.0 --exclude libuct.so.0 --exclude libucs.so.0 --exclude libucm.so.0 " # disable repair wheel
 build = [
-  "cp310-manylinux_x86_64",
   "cp311-manylinux_x86_64",
   "cp312-manylinux_x86_64",
   "cp313-manylinux_x86_64",
@@ -67,3 +66,6 @@ before-all = [
   "cd / && curl -L https://github.com/openucx/ucx/releases/download/v1.18.1/ucx-1.18.1.tar.gz -o ucx.tar.gz && tar xf ucx.tar.gz",
   "cd /ucx-1.18.1 && ./contrib/configure-release --disable-doxygen-doc --disable-doxygen-man --disable-doxygen-html --enable-optimizations --enable-tuning  --enable-devel-headers  --with-avx --with-mlx5 --with-rc --with-ud --with-dc --with-ib-hw-tm --with-dm --with-rdmacm=/usr/local && make -j && make install",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

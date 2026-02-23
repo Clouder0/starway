@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(DEV_MODULE Development.Module)
 
-find_package(Python 3.10 COMPONENTS Interpreter ${DEV_MODULE} REQUIRED)
+find_package(Python 3.11 COMPONENTS Interpreter ${DEV_MODULE} REQUIRED)
 message(STATUS "Found Python: ${Python_EXECUTABLE}")
 
 # Detect the installed nanobind package and import it into CMake
