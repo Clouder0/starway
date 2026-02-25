@@ -1,0 +1,51 @@
+[campaign]
+id = "cluster_loopback_smoke_v1"
+results_dir = "results"
+repeats = 1
+seed = 42
+
+[execution]
+mode = "cluster"
+topology = "two_process"
+
+# Safety valves.
+point_timeout_s = 30.0
+close_timeout_s = 5.0
+
+[cluster]
+# Coordinator control-plane listen.
+coordinator_bind_host = "127.0.0.1"
+coordinator_port = 5001
+
+# Two local agents (localhost is fine for this smoke config).
+server_agent_id = "hostA"
+client_agent_id = "hostB"
+
+# Data-plane ports used by the server agent.
+port_range_min = 32000
+port_range_max = 32500
+
+agent_connect_timeout_s = 10.0
+agent_rpc_timeout_s = 10.0
+
+[[comparators]]
+name = "asyncio_tcp"
+type = "asyncio_tcp"
+
+[comparators.options]
+tcp_nodelay = true
+
+[[comparators]]
+name = "ucx_tcp"
+type = "starway_tcp"
+
+[comparators.env]
+UCX_TLS = "tcp"
+
+[[workloads]]
+name = "control_rtt"
+
+[workloads.matrix]
+msg_bytes = [64, 1024]
+warmup_iters = [50]
+iters = [200]

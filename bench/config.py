@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import tomllib
 from dataclasses import asdict
@@ -10,6 +11,7 @@ from typing import Any
 from .types import (
     BenchConfig,
     CampaignConfig,
+    ClusterConfig,
     ComparatorSpec,
     ExecutionConfig,
     WorkloadSpec,
@@ -26,6 +28,31 @@ def _require_list(value: Any, *, ctx: str) -> list[Any]:
     if not isinstance(value, list):
         raise ValueError(f"Expected list for {ctx}, got {type(value).__name__}")
     return value
+
+
+def _require_non_empty_str(value: Any, *, ctx: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{ctx} must be a non-empty string")
+    return str(value)
+
+
+def _require_ipv4(value: Any, *, ctx: str) -> str:
+    host = _require_non_empty_str(value, ctx=ctx)
+    try:
+        ipaddress.IPv4Address(host)
+    except Exception as exc:
+        raise ValueError(f"{ctx} must be an IPv4 address string") from exc
+    return host
+
+
+def _require_port(value: Any, *, ctx: str) -> int:
+    try:
+        port = int(value)
+    except Exception as exc:
+        raise ValueError(f"{ctx} must be an integer port") from exc
+    if not (1 <= port <= 65535):
+        raise ValueError(f"{ctx} must be in [1, 65535]")
+    return int(port)
 
 
 def load_config(path: str | Path) -> BenchConfig:
@@ -66,6 +93,31 @@ def load_config(path: str | Path) -> BenchConfig:
     mode = execution_raw.get("mode", "self")
     if mode not in ("self", "cluster"):
         raise ValueError("execution.mode must be 'self' or 'cluster'")
+
+    topology = execution_raw.get("topology", "two_process")
+    if not isinstance(topology, str) or not topology.strip():
+        raise ValueError("execution.topology must be a non-empty string")
+    if topology != "two_process":
+        raise ValueError(
+            "execution.topology must be 'two_process' (inproc topology was removed)"
+        )
+
+    cpu_affinity_raw = execution_raw.get("cpu_affinity", [])
+    if cpu_affinity_raw is None:
+        cpu_affinity_raw = []
+    cpu_affinity_raw = _require_list(cpu_affinity_raw, ctx="execution.cpu_affinity")
+    cpu_affinity: tuple[int, ...] = tuple(int(v) for v in cpu_affinity_raw)
+    if any(v < 0 for v in cpu_affinity):
+        raise ValueError("execution.cpu_affinity values must be >= 0")
+
+    payload_verify = execution_raw.get("payload_verify", "none")
+    if not isinstance(payload_verify, str) or not payload_verify.strip():
+        raise ValueError("execution.payload_verify must be a non-empty string")
+    if payload_verify not in ("none", "preflight", "full"):
+        raise ValueError(
+            "execution.payload_verify must be 'none', 'preflight', or 'full'"
+        )
+
     point_timeout_s = float(execution_raw.get("point_timeout_s", 60.0))
     if point_timeout_s <= 0:
         raise ValueError("execution.point_timeout_s must be > 0")
@@ -74,7 +126,12 @@ def load_config(path: str | Path) -> BenchConfig:
         raise ValueError("execution.close_timeout_s must be > 0")
 
     execution = ExecutionConfig(
-        mode=mode, point_timeout_s=point_timeout_s, close_timeout_s=close_timeout_s
+        mode=mode,
+        topology=topology,
+        cpu_affinity=cpu_affinity,
+        payload_verify=payload_verify,
+        point_timeout_s=point_timeout_s,
+        close_timeout_s=close_timeout_s,
     )
 
     comparators_raw = _require_list(raw.get("comparators"), ctx="comparators")
@@ -129,11 +186,78 @@ def load_config(path: str | Path) -> BenchConfig:
     if not workloads:
         raise ValueError("workloads must be a non-empty list")
 
+    cluster: ClusterConfig | None = None
+    if execution.mode == "cluster":
+        cluster_doc = raw.get("cluster")
+        if cluster_doc is None:
+            raise ValueError(
+                "cluster.coordinator_bind_host is required when execution.mode='cluster'"
+            )
+        cluster_raw = _require_mapping(cluster_doc, ctx="cluster")
+
+        coordinator_bind_host = _require_ipv4(
+            cluster_raw.get("coordinator_bind_host"),
+            ctx="cluster.coordinator_bind_host",
+        )
+        coordinator_port = _require_port(
+            cluster_raw.get("coordinator_port"), ctx="cluster.coordinator_port"
+        )
+        server_agent_id = _require_non_empty_str(
+            cluster_raw.get("server_agent_id"), ctx="cluster.server_agent_id"
+        )
+        client_agent_id = _require_non_empty_str(
+            cluster_raw.get("client_agent_id"), ctx="cluster.client_agent_id"
+        )
+
+        port_range_min = _require_port(
+            cluster_raw.get("port_range_min"), ctx="cluster.port_range_min"
+        )
+        port_range_max = _require_port(
+            cluster_raw.get("port_range_max"), ctx="cluster.port_range_max"
+        )
+        if port_range_min > port_range_max:
+            raise ValueError("cluster.port_range_min must be <= cluster.port_range_max")
+        if (port_range_max - port_range_min + 1) < 2:
+            raise ValueError(
+                "cluster port range must contain at least 2 ports (for 2-socket workloads)"
+            )
+
+        agent_connect_timeout_s = float(
+            cluster_raw.get("agent_connect_timeout_s", 15.0)
+        )
+        if agent_connect_timeout_s <= 0:
+            raise ValueError("cluster.agent_connect_timeout_s must be > 0")
+        agent_rpc_timeout_s = float(cluster_raw.get("agent_rpc_timeout_s", 10.0))
+        if agent_rpc_timeout_s <= 0:
+            raise ValueError("cluster.agent_rpc_timeout_s must be > 0")
+
+        # Cluster mode is host-to-host; shm_py is single-host only.
+        for c in comparators:
+            if c.type == "shm_py":
+                raise ValueError("cluster mode does not support shm_py")
+            if c.type == "starway_ucx":
+                raise ValueError(
+                    "cluster mode does not support starway_ucx (worker-address); "
+                    "use starway_tcp (sockaddr ip:port) instead"
+                )
+
+        cluster = ClusterConfig(
+            coordinator_bind_host=coordinator_bind_host,
+            coordinator_port=coordinator_port,
+            server_agent_id=server_agent_id,
+            client_agent_id=client_agent_id,
+            port_range_min=port_range_min,
+            port_range_max=port_range_max,
+            agent_connect_timeout_s=agent_connect_timeout_s,
+            agent_rpc_timeout_s=agent_rpc_timeout_s,
+        )
+
     return BenchConfig(
         campaign=campaign,
         execution=execution,
         comparators=comparators,
         workloads=workloads,
+        cluster=cluster,
     )
 
 

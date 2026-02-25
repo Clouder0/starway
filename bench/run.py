@@ -15,10 +15,8 @@ if __package__ in (None, ""):  # Allow running as `python bench/run.py`
     sys.path.insert(0, str(repo_root))
 
 from bench.config import load_config, stable_config_hash  # noqa: E402
-from bench.comparators import Pair  # noqa: E402
 from bench.planner import plan_manifest  # noqa: E402
 from bench.results import ResultWriter  # noqa: E402
-from bench.workloads import WORKLOAD_RUNNERS, control_under_load  # noqa: E402
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -37,59 +35,8 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _create_pair(
-    comparator_type: str, *, env: dict[str, str], options: dict[str, Any]
-) -> Pair:
-    if comparator_type == "asyncio_tcp":
-        from bench.comparators.asyncio_tcp import create_self_pair
-
-        a, b = await create_self_pair(options)
-        return Pair(a=a, b=b)
-
-    if comparator_type == "starway_tcp":
-        from bench.comparators.starway_tcp import create_self_pair
-
-        a, b = await create_self_pair(env=env, options=options)
-        return Pair(a=a, b=b)
-
-    raise ValueError(f"Unknown comparator type '{comparator_type}'")
-
-
-async def _close_pair(pair: Pair, *, close_timeout_s: float) -> None:
-    # Best-effort: flush (when available) and close both sides.
-    #
-    # Starway/UCX can emit noisy warnings if one side closes while the other is
-    # still flushing in-flight requests. We attempt a cooperative flush first.
-    a = pair.a
-    b = pair.b
-    if hasattr(a, "client") and hasattr(b, "server") and hasattr(b, "endpoint"):
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(
-                    a.client.aflush(),  # type: ignore[attr-defined]
-                    b.server.aflush_ep(b.endpoint),  # type: ignore[attr-defined]
-                ),
-                timeout=close_timeout_s,
-            )
-        except Exception:
-            pass
-
-    try:
-        await asyncio.wait_for(a.close(), timeout=close_timeout_s)
-    except Exception:
-        pass
-    try:
-        await asyncio.wait_for(b.close(), timeout=close_timeout_s)
-    except Exception:
-        pass
-
-
 async def run_campaign(config_path: Path, *, dry_run: bool) -> int:
     config = load_config(config_path)
-    if config.execution.mode != "self":
-        raise NotImplementedError(
-            "cluster mode is TODO in MVP (config.execution.mode != 'self')"
-        )
 
     manifest = plan_manifest(config)
     if dry_run:
@@ -120,99 +67,182 @@ async def run_campaign(config_path: Path, *, dry_run: bool) -> int:
 
     comparator_by_name = {c.name: c for c in config.comparators}
 
-    for point in manifest:
-        writer.log_event(
-            {
-                "type": "point_start",
-                "ts": time.time(),
+    if config.execution.mode == "self":
+        for point in manifest:
+            writer.log_event(
+                {
+                    "type": "point_start",
+                    "ts": time.time(),
+                    "point_id": point.point_id,
+                    "comparator": point.comparator,
+                    "workload": point.workload,
+                    "repeat": point.repeat,
+                }
+            )
+
+            comparator = comparator_by_name[point.comparator]
+            params = dict(point.params)
+            params.setdefault(
+                "seed", int(config.campaign.seed) ^ int(point.point_id, 16)
+            )
+            t0 = time.time()
+
+            record: dict[str, Any] = {
+                "campaign_id": config.campaign.id,
                 "point_id": point.point_id,
                 "comparator": point.comparator,
                 "workload": point.workload,
                 "repeat": point.repeat,
+                "params": params,
+                "status": "failed",
+                "metrics": {},
+                "started_ts": t0,
             }
-        )
 
-        comparator = comparator_by_name[point.comparator]
-        params = dict(point.params)
-        params.setdefault("seed", int(config.campaign.seed) ^ int(point.point_id, 16))
-        t0 = time.time()
+            point_timeout_s = float(config.execution.point_timeout_s)
 
-        record: dict[str, Any] = {
-            "campaign_id": config.campaign.id,
-            "point_id": point.point_id,
-            "comparator": point.comparator,
-            "workload": point.workload,
-            "repeat": point.repeat,
-            "params": params,
-            "status": "failed",
-            "metrics": {},
-            "started_ts": t0,
-        }
+            try:
+                async with asyncio.timeout(point_timeout_s):
+                    from bench.topology_2proc import run_two_process_point
 
-        pair: Pair | None = None
-        data_pair: Pair | None = None
-        control_pair: Pair | None = None
-        point_timeout_s = float(config.execution.point_timeout_s)
-        close_timeout_s = float(config.execution.close_timeout_s)
-
-        try:
-            async with asyncio.timeout(point_timeout_s):
-                if point.workload == "control_under_load":
-                    data_pair = await _create_pair(
-                        comparator.type, env=comparator.env, options=comparator.options
-                    )
-                    control_pair = await _create_pair(
-                        comparator.type, env=comparator.env, options=comparator.options
-                    )
-                    result = await control_under_load(
-                        data_pair=data_pair,
-                        control_pair=control_pair,
+                    result = await run_two_process_point(
+                        comparator_type=comparator.type,
+                        comparator_env=comparator.env,
+                        comparator_options=comparator.options,
+                        workload=point.workload,
                         params=params,
+                        cpu_affinity=tuple(config.execution.cpu_affinity),
+                        payload_verify=config.execution.payload_verify,
                     )
-                else:
-                    runner = WORKLOAD_RUNNERS.get(point.workload)
-                    if runner is None:
-                        raise ValueError(f"Unknown workload '{point.workload}'")
-                    pair = await _create_pair(
-                        comparator.type, env=comparator.env, options=comparator.options
-                    )
-                    result = await runner(pair, params)
 
-            record["status"] = "ok"
-            record["metrics"] = result.get("metrics", {})
-            if "warnings" in result:
-                record["warnings"] = result["warnings"]
-            for k in ("subresults",):
-                if k in result:
-                    record[k] = result[k]
-        except TimeoutError as exc:
-            record["status"] = "failed"
-            record["error"] = (
-                str(exc) or f"Point timed out after {point_timeout_s:.3f}s"
-            )
-            record["traceback"] = traceback.format_exc()
-        except Exception as exc:
-            record["status"] = "failed"
-            record["error"] = str(exc)
-            record["traceback"] = traceback.format_exc()
-        finally:
-            if pair is not None:
-                await _close_pair(pair, close_timeout_s=close_timeout_s)
-            if data_pair is not None:
-                await _close_pair(data_pair, close_timeout_s=close_timeout_s)
-            if control_pair is not None:
-                await _close_pair(control_pair, close_timeout_s=close_timeout_s)
-            record["ended_ts"] = time.time()
-            record["elapsed_s"] = float(record["ended_ts"] - record["started_ts"])
-            writer.write_point(point.point_id, record)
-            writer.log_event(
-                {
-                    "type": "point_end",
-                    "ts": time.time(),
+                record["status"] = "ok"
+                record["metrics"] = result.get("metrics", {})
+                if "warnings" in result:
+                    record["warnings"] = result["warnings"]
+                for k in ("subresults",):
+                    if k in result:
+                        record[k] = result[k]
+            except TimeoutError as exc:
+                record["status"] = "failed"
+                record["error"] = (
+                    str(exc) or f"Point timed out after {point_timeout_s:.3f}s"
+                )
+                record["traceback"] = traceback.format_exc()
+            except Exception as exc:
+                record["status"] = "failed"
+                record["error"] = str(exc)
+                record["traceback"] = traceback.format_exc()
+            finally:
+                record["ended_ts"] = time.time()
+                record["elapsed_s"] = float(record["ended_ts"] - record["started_ts"])
+                writer.write_point(point.point_id, record)
+                writer.log_event(
+                    {
+                        "type": "point_end",
+                        "ts": time.time(),
+                        "point_id": point.point_id,
+                        "status": record["status"],
+                    }
+                )
+    elif config.execution.mode == "cluster":
+        if config.cluster is None:
+            raise ValueError("cluster config is required when execution.mode='cluster'")
+
+        from bench.topology_cluster import ClusterSession
+
+        async with ClusterSession(cluster=config.cluster) as session:
+            for point in manifest:
+                writer.log_event(
+                    {
+                        "type": "point_start",
+                        "ts": time.time(),
+                        "point_id": point.point_id,
+                        "comparator": point.comparator,
+                        "workload": point.workload,
+                        "repeat": point.repeat,
+                    }
+                )
+
+                comparator = comparator_by_name[point.comparator]
+                params = dict(point.params)
+                params.setdefault(
+                    "seed", int(config.campaign.seed) ^ int(point.point_id, 16)
+                )
+                t0 = time.time()
+
+                record: dict[str, Any] = {
+                    "campaign_id": config.campaign.id,
                     "point_id": point.point_id,
-                    "status": record["status"],
+                    "comparator": point.comparator,
+                    "workload": point.workload,
+                    "repeat": point.repeat,
+                    "params": params,
+                    "status": "failed",
+                    "metrics": {},
+                    "started_ts": t0,
                 }
-            )
+
+                point_timeout_s = float(config.execution.point_timeout_s)
+                point_spec = {
+                    "comparator_type": comparator.type,
+                    "comparator_env": dict(comparator.env),
+                    "comparator_options": dict(comparator.options),
+                    "workload": str(point.workload),
+                    "params": params,
+                    "cpu_affinity": list(config.execution.cpu_affinity),
+                    "payload_verify": config.execution.payload_verify,
+                    "point_timeout_s": point_timeout_s,
+                }
+
+                try:
+                    async with asyncio.timeout(point_timeout_s):
+                        connect, result = await session.run_point(
+                            point_id=point.point_id,
+                            point_spec=point_spec,
+                        )
+
+                    record["status"] = "ok"
+                    record["connect"] = connect
+                    record["metrics"] = result.get("metrics", {})
+                    if "warnings" in result:
+                        record["warnings"] = result["warnings"]
+                    for k in ("subresults",):
+                        if k in result:
+                            record[k] = result[k]
+                except TimeoutError as exc:
+                    record["status"] = "failed"
+                    record["error"] = (
+                        str(exc) or f"Point timed out after {point_timeout_s:.3f}s"
+                    )
+                    record["traceback"] = traceback.format_exc()
+                    try:
+                        await session.cancel_point(point_id=point.point_id)
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    record["status"] = "failed"
+                    record["error"] = str(exc)
+                    record["traceback"] = traceback.format_exc()
+                    try:
+                        await session.cancel_point(point_id=point.point_id)
+                    except Exception:
+                        pass
+                finally:
+                    record["ended_ts"] = time.time()
+                    record["elapsed_s"] = float(
+                        record["ended_ts"] - record["started_ts"]
+                    )
+                    writer.write_point(point.point_id, record)
+                    writer.log_event(
+                        {
+                            "type": "point_end",
+                            "ts": time.time(),
+                            "point_id": point.point_id,
+                            "status": record["status"],
+                        }
+                    )
+    else:
+        raise ValueError(f"unknown execution.mode: {config.execution.mode}")
 
     writer.log_event(
         {"type": "run_end", "ts": time.time(), "campaign_id": config.campaign.id}

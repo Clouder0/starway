@@ -8,3 +8,7 @@ dist
 .pytest_cache
 wheelhouse
 results/
+
+# Report generator outputs / local configs
+artifacts/
+starway-report.local.toml

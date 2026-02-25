@@ -1,0 +1,54 @@
+[campaign]
+id = "self_ucx_tcp_tune_probe_v1"
+results_dir = "results"
+repeats = 1
+seed = 42
+
+[execution]
+mode = "self"
+topology = "two_process"
+
+# Safety valves.
+point_timeout_s = 60.0
+close_timeout_s = 5.0
+
+[[comparators]]
+name = "asyncio_tcp"
+type = "asyncio_tcp"
+
+[comparators.options]
+tcp_nodelay = true
+
+[[comparators]]
+name = "ucx_tcp_default"
+type = "starway_ucx"
+
+[comparators.env]
+UCX_TLS = "tcp"
+
+[[comparators]]
+name = "ucx_tcp_tuned"
+type = "starway_ucx"
+
+[comparators.env]
+UCX_TLS = "tcp"
+UCX_TCP_TX_SEG_SIZE = "256kb"
+UCX_TCP_RX_SEG_SIZE = "256kb"
+
+[[workloads]]
+name = "bulk_stream"
+
+[[workloads.points]]
+chunk_bytes = "16MiB"
+inflight = 4
+ack_every_n = 4
+duration_s = 2.0
+
+[[workloads]]
+name = "small_message_pressure"
+
+[workloads.matrix]
+msg_bytes = [65536]
+inflight = [64]
+ack_every_n = [64]
+duration_s = [2.0]

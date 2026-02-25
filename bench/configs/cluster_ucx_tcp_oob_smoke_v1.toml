@@ -1,0 +1,64 @@
+[campaign]
+# Minimal cluster-mode sanity check (connectivity + basic UCX/TCP).
+id = "cluster_ucx_tcp_oob_smoke_v1"
+results_dir = "results"
+repeats = 1
+seed = 42
+
+[execution]
+mode = "cluster"
+topology = "two_process"
+
+# Keep these conservative for remote clusters.
+point_timeout_s = 60.0
+close_timeout_s = 5.0
+
+[cluster]
+# Run the coordinator on some reachable host.
+# Use 0.0.0.0 to bind all interfaces on that host.
+coordinator_bind_host = "0.0.0.0"
+coordinator_port = 5001
+
+# Agent IDs must match the --agent-id CLI flags you run on each host.
+server_agent_id = "hostA"
+client_agent_id = "hostB"
+
+# Open this inbound port range on the *server* host (hostA).
+# Needs to be large enough to avoid bind collisions.
+port_range_min = 20000
+port_range_max = 25000
+
+agent_connect_timeout_s = 30.0
+agent_rpc_timeout_s = 15.0
+
+[[comparators]]
+name = "asyncio_tcp"
+type = "asyncio_tcp"
+
+[comparators.options]
+tcp_nodelay = true
+
+[[comparators]]
+name = "ucx_tcp_default"
+type = "starway_tcp"
+
+[comparators.env]
+UCX_TLS = "tcp"
+
+[[comparators]]
+name = "ucx_tcp_tuned"
+type = "starway_tcp"
+
+[comparators.env]
+UCX_TLS = "tcp"
+UCX_TCP_TX_SEG_SIZE = "256K"
+UCX_TCP_RX_SEG_SIZE = "256K"
+
+[[workloads]]
+name = "control_rtt"
+
+[workloads.matrix]
+# Keep it tiny; this config is only meant to validate cluster wiring.
+msg_bytes = [64, 1024]
+warmup_iters = [50]
+iters = [200]

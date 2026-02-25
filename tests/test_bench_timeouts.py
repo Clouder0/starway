@@ -7,13 +7,9 @@ from typing import Any
 
 import pytest
 
-import bench.run as bench_run
 import bench.workloads as workloads
 from bench.comparators import Pair
 from bench.comparators.asyncio_tcp import create_self_pair
-from bench.comparators.asyncio_tcp import (
-    create_self_pair as create_asyncio_tcp_self_pair,
-)
 from bench.run import run_campaign
 from bench.workloads import small_message_pressure
 
@@ -55,7 +51,8 @@ seed = 0
 
 [execution]
 mode = "self"
-point_timeout_s = 0.2
+topology = "two_process"
+point_timeout_s = 2.0
 close_timeout_s = 0.2
 
 [[comparators]]
@@ -63,7 +60,14 @@ name = "asyncio_tcp"
 type = "asyncio_tcp"
 
 [[workloads]]
-name = "hung"
+name = "bulk_stream"
+
+[[workloads.points]]
+chunk_bytes = 1
+duration_s = 5.0
+inflight = 1
+ack_every_n = 1
+seed = 1
 
 [[workloads]]
 name = "control_rtt"
@@ -75,17 +79,8 @@ iters = 1
 """.lstrip()
     cfg_path.write_text(cfg_text, encoding="utf-8")
 
-    async def hung_runner(pair: Pair, params: dict) -> dict:
-        _ = pair, params
-        await asyncio.sleep(1.0)
-        return {"metrics": {}}
-
-    bench_run.WORKLOAD_RUNNERS["hung"] = hung_runner
-    try:
-        rc = await run_campaign(cfg_path, dry_run=False)
-        assert rc == 0
-    finally:
-        bench_run.WORKLOAD_RUNNERS.pop("hung", None)
+    rc = await run_campaign(cfg_path, dry_run=False)
+    assert rc == 0
 
     campaign_dir = results_dir / "timeout_campaign"
     run_dirs = [p for p in campaign_dir.iterdir() if p.is_dir()]
@@ -150,7 +145,7 @@ async def test_control_rtt_cancel_does_not_leak_responder_task() -> None:
             continue
         coro = t.get_coro()
         name = getattr(getattr(coro, "cr_code", None), "co_name", "")
-        if name == "side_b":
+        if name == "control_rtt_server":
             leaked_side_b.append(t)
 
     # Cleanup even when failing, so we don't poison the rest of the suite.
@@ -286,7 +281,7 @@ async def test_asyncio_tcp_create_self_pair_cancellation_cleans_accept_task(
     monkeypatch.setattr(loop, "sock_connect", blocked_sock_connect)
 
     before = set(asyncio.all_tasks())
-    task = asyncio.create_task(create_asyncio_tcp_self_pair({"tcp_nodelay": True}))
+    task = asyncio.create_task(create_self_pair({"tcp_nodelay": True}))
     await connect_started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

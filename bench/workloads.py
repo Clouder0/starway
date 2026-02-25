@@ -7,7 +7,8 @@ from typing import Any
 
 import numpy as np
 
-from .comparators import Pair
+from .barrier import barrier
+from .comparators import Pair, Peer
 from .util import parse_size
 
 
@@ -39,8 +40,8 @@ def _latency_metrics_us(durations_s: list[float]) -> dict[str, float]:
     }
 
 
-async def control_rtt(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
-    """Ping-pong RTT on a single connection."""
+async def control_rtt_server(peer: Peer, params: dict[str, Any]) -> None:
+    """Respond to pings from control_rtt_client."""
 
     msg_bytes = parse_size(params.get("msg_bytes", 64))
     warmup_iters = int(params.get("warmup_iters", 100))
@@ -52,40 +53,43 @@ async def control_rtt(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
     send_buf = np.zeros(msg_bytes, dtype=np.uint8)
     recv_buf = np.empty(msg_bytes, dtype=np.uint8)
 
-    async def side_b() -> None:
-        # Respond to warmup + measured pings.
-        expected = warmup_iters + iters
-        for _ in range(expected):
-            kind, seq, length = await pair.b.recv_any(recv_buf)
-            if kind != ping_kind:
-                raise RuntimeError(f"unexpected kind {kind} in control_rtt")
-            await pair.b.send(pong_kind, seq, send_buf)
+    expected = warmup_iters + iters
+    for _ in range(expected):
+        kind, seq, _ = await peer.recv_any(recv_buf)
+        if kind != ping_kind:
+            raise RuntimeError(f"unexpected kind {kind} in control_rtt")
+        await peer.send(pong_kind, seq, send_buf)
 
-    responder = asyncio.create_task(side_b())
+
+async def control_rtt_client(peer: Peer, params: dict[str, Any]) -> dict[str, Any]:
+    """Ping-pong RTT on a single connection (measured on the client side)."""
+
+    msg_bytes = parse_size(params.get("msg_bytes", 64))
+    warmup_iters = int(params.get("warmup_iters", 100))
+    iters = int(params.get("iters", 1000))
+
+    ping_kind = int(params.get("ping_kind", 1))
+    pong_kind = int(params.get("pong_kind", 2))
+
+    send_buf = np.zeros(msg_bytes, dtype=np.uint8)
+    recv_buf = np.empty(msg_bytes, dtype=np.uint8)
+
     durations: list[float] = []
-    try:
-        # Warmup
-        for i in range(1, warmup_iters + 1):
-            await pair.a.send(ping_kind, i, send_buf)
-            kind, seq, _ = await pair.a.recv_any(recv_buf)
-            if kind != pong_kind or seq != i:
-                raise RuntimeError("bad pong")
+    # Warmup
+    for i in range(1, warmup_iters + 1):
+        await peer.send(ping_kind, i, send_buf)
+        kind, seq, _ = await peer.recv_any(recv_buf)
+        if kind != pong_kind or seq != i:
+            raise RuntimeError("bad pong")
 
-        for i in range(warmup_iters + 1, warmup_iters + iters + 1):
-            t0 = time.perf_counter()
-            await pair.a.send(ping_kind, i, send_buf)
-            kind, seq, _ = await pair.a.recv_any(recv_buf)
-            t1 = time.perf_counter()
-            if kind != pong_kind or seq != i:
-                raise RuntimeError("bad pong")
-            durations.append(t1 - t0)
-    finally:
-        # If the benchmark is cancelled (e.g. point-level timeout), make sure we
-        # don't leak the responder task.
-        if not responder.done():
-            responder.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await responder
+    for i in range(warmup_iters + 1, warmup_iters + iters + 1):
+        t0 = time.perf_counter()
+        await peer.send(ping_kind, i, send_buf)
+        kind, seq, _ = await peer.recv_any(recv_buf)
+        t1 = time.perf_counter()
+        if kind != pong_kind or seq != i:
+            raise RuntimeError("bad pong")
+        durations.append(t1 - t0)
 
     metrics = _latency_metrics_us(durations)
     metrics["message_bytes"] = float(msg_bytes)
@@ -93,10 +97,20 @@ async def control_rtt(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
     return {"metrics": metrics}
 
 
-async def _one_way_stream(
+async def control_rtt(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
+    """In-process wrapper for control_rtt_client/control_rtt_server."""
+
+    # Await the server task in the success path.
+    # Cancelling recv loops early can leave Starway/UCX requests dangling.
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(control_rtt_server(pair.b, params))
+        client_t = tg.create_task(control_rtt_client(pair.a, params))
+    return client_t.result()
+
+
+async def _one_way_stream_sender(
     *,
-    sender,
-    receiver,
+    peer: Peer,
     data_kind: int,
     ack_kind: int,
     stop_kind: int,
@@ -108,7 +122,7 @@ async def _one_way_stream(
     ack_every_n: int,
     min_bytes: int = 0,
 ) -> dict[str, Any]:
-    """Delivery-complete one-way stream with cumulative ACK + STOP."""
+    """Sender side of a delivery-complete one-way stream."""
 
     if inflight <= 0:
         raise ValueError("inflight must be > 0")
@@ -130,9 +144,6 @@ async def _one_way_stream(
 
     ack_buf = np.array([1], dtype=np.uint8)
 
-    max_payload = max(payload_sizes) if payload_sizes else 0
-    recv_buf = np.empty(max_payload, dtype=np.uint8)
-
     acked_seq = 0
     ack_event = asyncio.Event()
     stop_seq: int | None = None
@@ -141,7 +152,7 @@ async def _one_way_stream(
         nonlocal acked_seq
         tmp = np.empty(1, dtype=np.uint8)
         while True:
-            kind, seq, _ = await sender.recv_any(tmp)
+            kind, seq, _ = await peer.recv_any(tmp)
             if kind != ack_kind:
                 raise RuntimeError(f"unexpected kind {kind} in ack_receiver")
             if seq > acked_seq:
@@ -150,63 +161,7 @@ async def _one_way_stream(
             if stop_seq is not None and acked_seq >= stop_seq:
                 return
 
-    bytes_received = 0
-    messages_received = 0
-    contig_received = 0
-    out_of_order: set[int] = set()
-    last_ack_sent = 0
-
-    async def data_receiver() -> int:
-        """Receive data until STOP is safe to ACK.
-
-        We only ACK contiguous delivery progress. For delivery-complete semantics,
-        we delay ACKing STOP until all seq < stop_seq have been received.
-        """
-
-        nonlocal bytes_received, messages_received, contig_received, last_ack_sent
-        stop_seen: int | None = None
-
-        while True:
-            kind, seq, length = await receiver.recv_any(recv_buf)
-            if kind == data_kind:
-                bytes_received += int(length)
-                messages_received += 1
-
-                if seq == contig_received + 1:
-                    contig_received = seq
-                    # Drain any contiguous seqs we already received out-of-order.
-                    while (contig_received + 1) in out_of_order:
-                        out_of_order.remove(contig_received + 1)
-                        contig_received += 1
-                elif seq > contig_received + 1:
-                    out_of_order.add(seq)
-
-                # Throttled cumulative ACK: report contiguous delivery progress.
-                if (
-                    contig_received - last_ack_sent >= ack_every_n_effective
-                    and contig_received
-                ):
-                    last_ack_sent = contig_received
-                    await receiver.send(ack_kind, contig_received, ack_buf)
-
-                # If we've already seen STOP, ACK it only once all data arrives.
-                if stop_seen is not None:
-                    stop_seq = int(stop_seen)
-                    if contig_received >= stop_seq - 1:
-                        await receiver.send(ack_kind, stop_seq, ack_buf)
-                        return stop_seq
-
-            elif kind == stop_kind:
-                stop_seen = int(seq)
-                if contig_received >= stop_seen - 1:
-                    await receiver.send(ack_kind, stop_seen, ack_buf)
-                    return stop_seen
-
-            else:
-                raise RuntimeError(f"unexpected kind {kind} in data_receiver")
-
     ack_task = asyncio.create_task(ack_receiver())
-    recv_task = asyncio.create_task(data_receiver())
 
     bytes_sent = 0
     messages_sent = 0
@@ -226,47 +181,33 @@ async def _one_way_stream(
             size = int(rng.choice(payload_sizes))
             buf = payload_pool[(seq - 1) % len(payload_pool)]
             view = buf[:size]
-            await sender.send(data_kind, seq, view)
+            await peer.send(data_kind, seq, view)
             bytes_sent += size
             messages_sent += 1
             seq += 1
 
         stop_seq = seq
-        await sender.send(stop_kind, stop_seq, ack_buf)
 
-        stop_seen = await recv_task
-        if stop_seen != stop_seq:
-            raise RuntimeError("receiver stop seq mismatch")
+        await peer.send(stop_kind, stop_seq, ack_buf)
 
         # Wait for final ACK (delivery-complete).
         await ack_task
         t1 = time.perf_counter()
 
-        # Invariants for "delivery-complete".
-        if messages_received != messages_sent:
-            raise RuntimeError(
-                f"delivery incomplete: messages_sent={messages_sent} "
-                f"messages_delivered={messages_received}"
-            )
-        if bytes_received != bytes_sent:
-            raise RuntimeError(
-                f"delivery incomplete: bytes_sent={bytes_sent} bytes_delivered={bytes_received}"
-            )
-
         elapsed = t1 - t0
-        goodput_gbps = (bytes_received * 8 / elapsed) / 1e9 if elapsed > 0 else 0.0
+        goodput_gbps = (bytes_sent * 8 / elapsed) / 1e9 if elapsed > 0 else 0.0
 
         out: dict[str, Any] = {
             "metrics": {
                 "duration_s": float(duration_s),
                 "elapsed_s": float(elapsed),
                 "bytes_sent": float(bytes_sent),
-                "bytes_delivered": float(bytes_received),
+                "bytes_delivered": float(bytes_sent),
                 "messages_sent": float(messages_sent),
-                "messages_delivered": float(messages_received),
+                "messages_delivered": float(messages_sent),
                 "goodput_gbps": float(goodput_gbps),
                 "ack_every_n_effective": float(ack_every_n_effective),
-                "volume_ok": float(1.0 if bytes_received >= min_bytes else 0.0),
+                "volume_ok": float(1.0 if bytes_sent >= min_bytes else 0.0),
             }
         }
         if warnings:
@@ -275,15 +216,88 @@ async def _one_way_stream(
     finally:
         if not ack_task.done():
             ack_task.cancel()
-        if not recv_task.done():
-            recv_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await ack_task
-        with contextlib.suppress(asyncio.CancelledError):
-            await recv_task
 
 
-async def small_message_pressure(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
+async def _one_way_stream_receiver(
+    *,
+    peer: Peer,
+    data_kind: int,
+    ack_kind: int,
+    stop_kind: int,
+    max_payload: int,
+    ack_every_n: int,
+    inflight: int,
+) -> None:
+    """Receiver side of a delivery-complete one-way stream."""
+
+    if inflight <= 0:
+        raise ValueError("inflight must be > 0")
+    if ack_every_n <= 0:
+        raise ValueError("ack_every_n must be > 0")
+
+    # Keep sender from deadlocking (must match sender clamp behavior).
+    ack_every_n_effective = min(ack_every_n, inflight)
+
+    ack_buf = np.array([1], dtype=np.uint8)
+    recv_buf = np.empty(max_payload, dtype=np.uint8)
+
+    contig_received = 0
+    out_of_order: set[int] = set()
+    last_ack_sent = 0
+    stop_seen: int | None = None
+
+    while True:
+        kind, seq, _length = await peer.recv_any(recv_buf)
+        if kind == data_kind:
+            if seq == contig_received + 1:
+                contig_received = seq
+                while (contig_received + 1) in out_of_order:
+                    out_of_order.remove(contig_received + 1)
+                    contig_received += 1
+            elif seq > contig_received + 1:
+                out_of_order.add(seq)
+
+            if (
+                contig_received - last_ack_sent >= ack_every_n_effective
+                and contig_received
+            ):
+                last_ack_sent = contig_received
+                await peer.send(ack_kind, contig_received, ack_buf)
+
+            if stop_seen is not None and contig_received >= stop_seen - 1:
+                await peer.send(ack_kind, stop_seen, ack_buf)
+                return
+
+        elif kind == stop_kind:
+            stop_seen = int(seq)
+            if contig_received >= stop_seen - 1:
+                await peer.send(ack_kind, stop_seen, ack_buf)
+                return
+        else:
+            raise RuntimeError(f"unexpected kind {kind} in data_receiver")
+
+
+async def small_message_pressure_server(peer: Peer, params: dict[str, Any]) -> None:
+    msg_bytes = parse_size(params.get("msg_bytes", 1024))
+    inflight = int(params.get("inflight", 64))
+    ack_every_n = int(params.get("ack_every_n", 256))
+
+    await _one_way_stream_receiver(
+        peer=peer,
+        data_kind=1,
+        ack_kind=2,
+        stop_kind=3,
+        max_payload=int(msg_bytes),
+        ack_every_n=ack_every_n,
+        inflight=inflight,
+    )
+
+
+async def small_message_pressure_client(
+    peer: Peer, params: dict[str, Any]
+) -> dict[str, Any]:
     msg_bytes = parse_size(params.get("msg_bytes", 1024))
     duration_s = float(params.get("duration_s", 2.0))
     inflight = int(params.get("inflight", 64))
@@ -294,9 +308,8 @@ async def small_message_pressure(pair: Pair, params: dict[str, Any]) -> dict[str
         np.zeros(msg_bytes, dtype=np.uint8) for _ in range(max(1, min(inflight, 4)))
     ]
 
-    return await _one_way_stream(
-        sender=pair.a,
-        receiver=pair.b,
+    return await _one_way_stream_sender(
+        peer=peer,
         data_kind=1,
         ack_kind=2,
         stop_kind=3,
@@ -310,7 +323,30 @@ async def small_message_pressure(pair: Pair, params: dict[str, Any]) -> dict[str
     )
 
 
-async def bulk_stream(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
+async def small_message_pressure(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(small_message_pressure_server(pair.b, params))
+        client_t = tg.create_task(small_message_pressure_client(pair.a, params))
+    return client_t.result()
+
+
+async def bulk_stream_server(peer: Peer, params: dict[str, Any]) -> None:
+    chunk_bytes = parse_size(params.get("chunk_bytes", "4MiB"))
+    inflight = int(params.get("inflight", 16))
+    ack_every_n = int(params.get("ack_every_n", 32))
+
+    await _one_way_stream_receiver(
+        peer=peer,
+        data_kind=1,
+        ack_kind=2,
+        stop_kind=3,
+        max_payload=int(chunk_bytes),
+        ack_every_n=ack_every_n,
+        inflight=inflight,
+    )
+
+
+async def bulk_stream_client(peer: Peer, params: dict[str, Any]) -> dict[str, Any]:
     chunk_bytes = parse_size(params.get("chunk_bytes", "4MiB"))
     duration_s = float(params.get("duration_s", 2.0))
     inflight = int(params.get("inflight", 16))
@@ -320,9 +356,8 @@ async def bulk_stream(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
     pool = [
         np.zeros(chunk_bytes, dtype=np.uint8) for _ in range(max(1, min(inflight, 4)))
     ]
-    return await _one_way_stream(
-        sender=pair.a,
-        receiver=pair.b,
+    return await _one_way_stream_sender(
+        peer=peer,
         data_kind=1,
         ack_kind=2,
         stop_kind=3,
@@ -336,7 +371,32 @@ async def bulk_stream(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-async def mixed_size(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
+async def bulk_stream(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
+    """In-process wrapper for bulk_stream_client/bulk_stream_server."""
+
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(bulk_stream_server(pair.b, params))
+        client_t = tg.create_task(bulk_stream_client(pair.a, params))
+    return client_t.result()
+
+
+async def mixed_size_server(peer: Peer, params: dict[str, Any]) -> None:
+    sizes = [parse_size(v) for v in params.get("sizes", ["64B", "1KiB", "64KiB"])]
+    inflight = int(params.get("inflight", 64))
+    ack_every_n = int(params.get("ack_every_n", 256))
+
+    await _one_way_stream_receiver(
+        peer=peer,
+        data_kind=1,
+        ack_kind=2,
+        stop_kind=3,
+        max_payload=int(max(sizes) if sizes else 0),
+        ack_every_n=ack_every_n,
+        inflight=inflight,
+    )
+
+
+async def mixed_size_client(peer: Peer, params: dict[str, Any]) -> dict[str, Any]:
     sizes = [parse_size(v) for v in params.get("sizes", ["64B", "1KiB", "64KiB"])]
     duration_s = float(params.get("duration_s", 2.0))
     inflight = int(params.get("inflight", 64))
@@ -348,9 +408,8 @@ async def mixed_size(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
     pool = [np.zeros(max_size, dtype=np.uint8) for _ in range(max(1, min(inflight, 4)))]
 
     # Use numpy choice over sizes directly (uniform by default).
-    return await _one_way_stream(
-        sender=pair.a,
-        receiver=pair.b,
+    return await _one_way_stream_sender(
+        peer=peer,
         data_kind=1,
         ack_kind=2,
         stop_kind=3,
@@ -364,28 +423,31 @@ async def mixed_size(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-async def bucket_duplex_step(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
+async def mixed_size(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(mixed_size_server(pair.b, params))
+        client_t = tg.create_task(mixed_size_client(pair.a, params))
+    return client_t.result()
+
+
+async def bucket_duplex_step_server(peer: Peer, params: dict[str, Any]) -> None:
     bucket_bytes = parse_size(params.get("bucket_bytes", "4MiB"))
     buckets_per_step = int(params.get("buckets_per_step", 8))
     steps = int(params.get("steps", 10))
 
     kind_bucket = int(params.get("bucket_kind", 1))
 
-    send_a = np.zeros(bucket_bytes, dtype=np.uint8)
-    send_b = np.zeros(bucket_bytes, dtype=np.uint8)
-    recv_a = np.empty(bucket_bytes, dtype=np.uint8)
-    recv_b = np.empty(bucket_bytes, dtype=np.uint8)
+    send_buf = np.zeros(bucket_bytes, dtype=np.uint8)
+    recv_buf = np.empty(bucket_bytes, dtype=np.uint8)
 
-    step_times: list[float] = []
-
-    async def run_step(peer_self, send_buf, recv_buf, start_seq: int) -> None:
+    async def run_step(start_seq: int) -> None:
         async def send_loop() -> None:
             for i in range(buckets_per_step):
-                await peer_self.send(kind_bucket, start_seq + i, send_buf)
+                await peer.send(kind_bucket, start_seq + i, send_buf)
 
         async def recv_loop() -> None:
             for _ in range(buckets_per_step):
-                kind, _, _ = await peer_self.recv_any(recv_buf)
+                kind, _, _ = await peer.recv_any(recv_buf)
                 if kind != kind_bucket:
                     raise RuntimeError(f"unexpected kind {kind} in bucket_duplex_step")
 
@@ -393,15 +455,49 @@ async def bucket_duplex_step(pair: Pair, params: dict[str, Any]) -> dict[str, An
 
     seq_offset_b = 10_000_000
     for step in range(steps):
-        start_a = step * buckets_per_step
         start_b = seq_offset_b + step * buckets_per_step
+
+        await barrier(peer, seq=step * 2)
+        await run_step(start_b)
+        await barrier(peer, seq=step * 2 + 1)
+
+
+async def bucket_duplex_step_client(
+    peer: Peer, params: dict[str, Any]
+) -> dict[str, Any]:
+    bucket_bytes = parse_size(params.get("bucket_bytes", "4MiB"))
+    buckets_per_step = int(params.get("buckets_per_step", 8))
+    steps = int(params.get("steps", 10))
+
+    kind_bucket = int(params.get("bucket_kind", 1))
+
+    send_buf = np.zeros(bucket_bytes, dtype=np.uint8)
+    recv_buf = np.empty(bucket_bytes, dtype=np.uint8)
+
+    step_times: list[float] = []
+
+    async def run_step(start_seq: int) -> None:
+        async def send_loop() -> None:
+            for i in range(buckets_per_step):
+                await peer.send(kind_bucket, start_seq + i, send_buf)
+
+        async def recv_loop() -> None:
+            for _ in range(buckets_per_step):
+                kind, _, _ = await peer.recv_any(recv_buf)
+                if kind != kind_bucket:
+                    raise RuntimeError(f"unexpected kind {kind} in bucket_duplex_step")
+
+        await asyncio.gather(send_loop(), recv_loop())
+
+    for step in range(steps):
+        start_a = step * buckets_per_step
+
+        await barrier(peer, seq=step * 2)
         t0 = time.perf_counter()
-        await asyncio.gather(
-            run_step(pair.a, send_a, recv_a, start_a),
-            run_step(pair.b, send_b, recv_b, start_b),
-        )
+        await run_step(start_a)
         t1 = time.perf_counter()
         step_times.append(t1 - t0)
+        await barrier(peer, seq=step * 2 + 1)
 
     total_payload = bucket_bytes * buckets_per_step * steps
     total_bits = total_payload * 2 * 8  # duplex
@@ -417,6 +513,13 @@ async def bucket_duplex_step(pair: Pair, params: dict[str, Any]) -> dict[str, An
         "aggregate_gbps": float(aggregate_gbps),
     }
     return {"metrics": metrics}
+
+
+async def bucket_duplex_step(pair: Pair, params: dict[str, Any]) -> dict[str, Any]:
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(bucket_duplex_step_server(pair.b, params))
+        client_t = tg.create_task(bucket_duplex_step_client(pair.a, params))
+    return client_t.result()
 
 
 async def control_under_load(

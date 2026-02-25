@@ -7,6 +7,8 @@ import socket
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
 
 TAG_KIND_SHIFT = 56
 TAG_SEQ_MASK = (1 << TAG_KIND_SHIFT) - 1
@@ -38,6 +40,33 @@ def _apply_env(env: dict[str, str]) -> None:
             )
 
 
+def _as_uint8_ndarray(payload: Any) -> np.ndarray:
+    """Coerce payloads into the ndarray[uint8] Starway bindings require."""
+
+    if isinstance(payload, np.ndarray):
+        arr = payload
+        if arr.dtype != np.uint8:
+            arr = arr.astype(np.uint8, copy=False)
+        if arr.ndim != 1:
+            arr = arr.reshape(-1)
+        if not arr.flags.c_contiguous:
+            arr = np.ascontiguousarray(arr)
+        return arr
+
+    if isinstance(payload, (bytes, bytearray, memoryview)):
+        arr = np.frombuffer(payload, dtype=np.uint8)
+        if not arr.flags.writeable:
+            arr = arr.copy()
+        return arr
+
+    arr = np.asarray(payload, dtype=np.uint8)
+    if arr.ndim != 1:
+        arr = arr.reshape(-1)
+    if not arr.flags.c_contiguous:
+        arr = np.ascontiguousarray(arr)
+    return arr
+
+
 def _pick_free_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -53,7 +82,7 @@ class StarwayClientPeer:
 
     async def send(self, kind: int, seq: int, payload: Any) -> None:
         tag = encode_tag(kind, seq)
-        await self.client.asend(payload, tag)
+        await self.client.asend(_as_uint8_ndarray(payload), tag)
 
     async def recv_any(self, buffer: Any) -> tuple[int, int, int]:
         sender_tag, length = await self.client.arecv(buffer, 0, 0)
@@ -71,7 +100,7 @@ class StarwayServerPeer:
 
     async def send(self, kind: int, seq: int, payload: Any) -> None:
         tag = encode_tag(kind, seq)
-        await self.server.asend(self.endpoint, payload, tag)
+        await self.server.asend(self.endpoint, _as_uint8_ndarray(payload), tag)
 
     async def recv_any(self, buffer: Any) -> tuple[int, int, int]:
         sender_tag, length = await self.server.arecv(buffer, 0, 0)

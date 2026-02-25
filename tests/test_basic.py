@@ -297,7 +297,8 @@ async def test_server_send_with_flush_ep_good(port):
     ctx = mp.get_context("spawn")
     p_server = ctx.Process(target=server_send_flush_ep, args=(port, True))
     p_server.start()
-    await asyncio.sleep(0.2)
+    # Spawn can take a while to import/init UCX; give the server time to listen.
+    await asyncio.sleep(0.5)
     client = Client()
     await client.aconnect(SERVER_ADDR, port)
     recv_buf = np.zeros(1024 * 1024 * 1024 * 8, dtype=np.uint8)
@@ -314,7 +315,8 @@ async def test_server_send_without_flush_ep_bad(port):
     ctx = mp.get_context("spawn")
     p_server = ctx.Process(target=server_send_flush_ep, args=(port, False))
     p_server.start()
-    await asyncio.sleep(0.2)
+    # Spawn can take a while to import/init UCX; give the server time to listen.
+    await asyncio.sleep(0.5)
     client = Client()
     await client.aconnect(SERVER_ADDR, port)
     recv_buf = np.zeros(1024 * 1024 * 1024 * 8, dtype=np.uint8)
